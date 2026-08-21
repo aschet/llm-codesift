@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# measurement output and generated reports
+results/
+report.html
+*.jsonl
+models*.txt
+!models.example.txt
+
+# archived measurement runs
+results-archive-*/
+results-partial-*/
