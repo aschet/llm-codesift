@@ -1,0 +1,5 @@
+# One model per line. Blank lines and comments are ignored.
+# Pass with: codesift run --models-file models.example.txt
+qwen3:14b
+granite4:8b
+gemma3:12b

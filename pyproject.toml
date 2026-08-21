@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "llm-codesift"
+version = "0.1.0"
+description = "Screening harness for locally hosted coding models served by Ollama"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+keywords = ["ollama", "llm", "benchmark", "evaluation", "local-models", "coding"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Testing",
+]
+dependencies = []
+
+[project.scripts]
+codesift = "codesift.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/aschet/llm-codesift"
+Issues = "https://github.com/aschet/llm-codesift/issues"
+
+[tool.pytest.ini_options]
+# The reference solutions are answers to the agent tasks, not part of this suite.
+# Their tests import a module that only resolves once the reference has been seeded
+# into a task repository, so collecting them here fails. The suite exercises them
+# through codesift.agent.verify instead, which is how a real run reaches them.
+# unittest already skips these directories, having no __init__.py.
+norecursedirs = ["tasklist_reference"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codesift"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/codesift", "tests", "README.md", "LICENSE", "pyproject.toml"]
