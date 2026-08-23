@@ -214,6 +214,30 @@ class TestRejectedAreNamed(unittest.TestCase):
         self.assertIn("hard-set 60%", page)
         self.assertEqual(page.count("<th>m:1</th>"), 1)
 
+    def test_a_rejected_model_also_gets_an_assessment_card(self):
+        # It was assessed, and the verdict is unsuitable; leaving it out of the
+        # cards makes the assessment look like the whole field when it is not.
+        self.write("triage.jsonl", [
+            dict(model="slow:1", passed=False, gate="speed",
+                 detail="generates 9 tok/s", seconds=11.0, ts=1.0),
+        ])
+        page = self.render(["slow:1"])
+        assessment = page.split(">Assessment", 1)[1].split("Ruled Out Before", 1)[0]
+        self.assertIn("slow:1", assessment)
+        self.assertIn("p-unsuitable", assessment)
+        self.assertIn("Rejected at the speed gate", assessment)
+
+    def test_the_card_does_not_imply_measurements_it_never_took(self):
+        self.write("triage.jsonl", [
+            dict(model="slow:1", passed=False, gate="speed",
+                 detail="generates 9 tok/s", seconds=11.0, ts=1.0),
+        ])
+        assessment = self.render(["slow:1"]).split(">Assessment", 1)[1] \
+                                            .split("Ruled Out Before", 1)[0]
+        self.assertIn("Nothing beyond this gate was", assessment)
+        for absent in ("Hard set", "Prefill @48k", "Speed score"):
+            self.assertNotIn(absent, assessment, absent)
+
     def test_a_field_with_no_rejections_gets_no_section(self):
         self.write("triage.jsonl", [
             dict(model="m:1", passed=True, gate="speed", detail="ok",

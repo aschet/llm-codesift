@@ -604,6 +604,24 @@ def build(cfg: Config, models: list[str]) -> str:
       <p class="why">{E("; ".join(why)) if why else "No disqualifying signal."}</p>
     </article>''')
 
+    # A model triage rejected belongs here too: it was assessed, and the verdict is
+    # unsuitable. Its figures are the ones the gate that stopped it measured and no
+    # others, because triage stops at the first answer that ends the matter -- so the
+    # card states what was measured and says plainly that the rest was not, rather
+    # than showing a dash that reads as a missing measurement.
+    for r in _rej:
+        rows_v.append(f'''<article class="card c-unsuitable">
+      <header><h3>{E(r["model"])}</h3>
+        <span class="pill p-unsuitable">unsuitable</span></header>
+      <p class="role">Rejected at the {E(r.get("gate") or "")} gate</p>
+      <dl>
+        <div><dt>Gate</dt><dd>{E(r.get("gate") or "&mdash;")}</dd></div>
+        <div><dt>Cost</dt><dd>{r.get("seconds") or 0:.0f}<span class="pc">s</span></dd></div>
+      </dl>
+      <p class="why">{E(r.get("detail") or "")}. Nothing beyond this gate was
+      measured, and its records were discarded with it.</p>
+    </article>''')
+
 
     def screen_table(agg_, label, total):
         if not agg_:
