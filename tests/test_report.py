@@ -171,6 +171,59 @@ class TestFailingModels(ReportCase):
         self.assertIn("ok", html)
 
 
+
+class TestRejectedAreNamed(unittest.TestCase):
+    """Pruning a discarded model removes its measurements, so a report built from
+    those measurements loses it entirely. Silence cannot distinguish a model that
+    failed from one that was never run, and the first is a finding."""
+
+    def setUp(self):
+        self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.cfg = Config(results_dir=self.tmp, models=[])
+
+    def write(self, name, rows):
+        with (self.tmp / name).open("w", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(json.dumps(row) + "\n")
+
+    def render(self, models):
+        out = self.tmp / "r.html"
+        report.run(Config(results_dir=self.tmp, models=models), out, models)
+        return out.read_text(encoding="utf-8")
+
+    def test_a_rejected_model_is_named_with_its_gate_and_reason(self):
+        self.write("triage.jsonl", [
+            dict(model="slow:1", passed=False, gate="speed",
+                 detail="generates 9 tok/s", seconds=11.0, ts=1.0),
+        ])
+        page = self.render(["slow:1"])
+        self.assertIn("Ruled Out Before Scoring", page)
+        self.assertIn("slow:1", page)
+        self.assertIn("speed", page)
+        self.assertIn("generates 9 tok/s", page)
+
+    def test_only_the_gate_that_decided_it_is_shown(self):
+        # Later gates never ran; reporting them would invent measurements.
+        self.write("triage.jsonl", [
+            dict(model="m:1", passed=True, gate="speed", detail="ok",
+                 seconds=1.0, ts=1.0),
+            dict(model="m:1", passed=False, gate="quality",
+                 detail="hard-set 60%", seconds=70.0, ts=2.0),
+        ])
+        page = self.render(["m:1"])
+        self.assertIn("hard-set 60%", page)
+        self.assertEqual(page.count("<th>m:1</th>"), 1)
+
+    def test_a_field_with_no_rejections_gets_no_section(self):
+        self.write("triage.jsonl", [
+            dict(model="m:1", passed=True, gate="speed", detail="ok",
+                 seconds=1.0, ts=1.0),
+        ])
+        self.assertNotIn("Ruled Out Before Scoring", self.render(["m:1"]))
+
+    def test_it_survives_no_triage_ledger_at_all(self):
+        self.assertNotIn("Ruled Out Before Scoring", self.render([]))
+
 if __name__ == "__main__":
     unittest.main()
 

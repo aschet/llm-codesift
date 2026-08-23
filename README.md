@@ -129,7 +129,9 @@ runs only models the screen called suitable or limited; `--select all` ignores t
 
 ## Interpreting the Report
 
-Models are labelled suitable, limited or unsuitable.
+Models are labelled suitable, limited or unsuitable. Models that triage ruled out are named
+separately with the gate they failed, since pruning a discarded model removes its measurements
+and silence cannot distinguish a model that failed from one that was never run.
 
 Unsuitable marks a failure that ends a model's usefulness: a tool call that could not be parsed
 or was never emitted, context truncation, failed retrieval at depth, generation below 20 tokens

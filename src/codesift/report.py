@@ -511,6 +511,26 @@ def build(cfg: Config, models: list[str]) -> str:
 
 
 
+    def rejected():
+        """Models triage ruled out, which no longer appear anywhere else.
+
+        Pruning a discarded model removes its measurements, so it vanishes from a
+        report built from those measurements. A reader then cannot tell whether a
+        model is missing because it failed, because it was never run, or because it
+        was never installed -- and the first of those is a finding. The triage
+        ledger outlives the pruning, so the rejection is still on record.
+        """
+        out = {}
+        for rec in _load(cfg.results_dir, "triage.jsonl"):
+            if rec.get("passed") or not rec.get("model"):
+                continue
+            # The first gate to reject a model is the one that decided it; a later
+            # gate never ran.
+            if rec["model"] not in out or rec["ts"] < out[rec["model"]]["ts"]:
+                out[rec["model"]] = rec
+        return [out[m] for m in sorted(out)]
+
+
     A = analyse(cfg, SHORTLIST)
     screen, probe, cache, agentic = A.screen, A.probe, A.cache, A.agentic
     by_set, t1, t2 = A.by_set, A.t1, A.t2
@@ -541,6 +561,25 @@ def build(cfg: Config, models: list[str]) -> str:
     def sev_of(pct):
         return "good" if pct >= 90 else "warn" if pct >= 75 else "bad"
 
+
+    _rej = rejected()
+    _rejrows = "".join(
+        f'<tr class="r-bad"><th>{E(r["model"])}</th>'
+        f'<td><span class="pill p-unsuitable">{E(r.get("gate") or "")}</span></td>'
+        f'<td class="detail">{E(r.get("detail") or "")}</td>'
+        f'<td class="figure">{r.get("seconds") or 0:.0f}s</td></tr>' for r in _rej)
+    rejsec = (f"""<section>
+      <h2>Ruled Out Before Scoring</h2>
+      <div class="lede"><p>Triage asks the cheapest decisive question first and stops at the
+    first answer that ends the matter, so these models were rejected without paying for the
+    full run. Each gate applies a rule the report applies anyway, so a model rejected here is
+    one the full run would have rejected. Their measurements were discarded with them, which is
+    why they appear in no other table: without this one, nothing would distinguish a model that
+    failed from a model that was never run.</p></div>
+      <div class="scroll"><table><thead><tr>
+        <th>Model</th><th>Gate</th><th>Why</th><th class="figure">Cost</th>
+      </tr></thead><tbody>{_rejrows}</tbody></table></div>
+    </section>""" if _rej else "")
 
     rows_v = []
     for m in ranked:
@@ -975,6 +1014,8 @@ def build(cfg: Config, models: list[str]) -> str:
     value that breached it.</p></div>
       <div class="cards">{"".join(rows_v)}</div>
     </section>
+
+    {rejsec}
 
     {screen_table(t2, "Hard Set", 15)}
     {screen_table(t1, "Basic Set", 14)}
