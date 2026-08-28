@@ -89,15 +89,23 @@ def _run_tasks(cfg: Config, client: Ollama, model: str,
 
     Recorded as run 1, which is the run the screen would fill first.
     """
-    ledger = cfg.path("screen_tasks.jsonl")
-    done = screen.load_ledger(ledger)
+    path = cfg.path("screen_tasks.jsonl")
+    done = screen.load_ledger(path)
     tasks = [t for t in TASKS if not only or t["id"] in set(only)]
-    return screen.measure_tasks(client, cfg, model, 1, tasks, done, ledger)
+    return screen.measure_tasks(client, cfg, model, 1, tasks, done, path)
 
 
 def gate_tools(cfg: Config, client: Ollama, model: str) -> tuple[bool, list, dict]:
-    """A call the harness cannot parse ends a session, so it ends the screen."""
+    """A call the harness cannot parse ends a session, so it ends the screen.
+
+    A request that failed is reported as the failure it was. It is not a call the
+    harness could not parse: the model never got to make one, and a dropped
+    connection is not a fact about the model.
+    """
     results = _run_tasks(cfg, client, model, _toolcall_ids())
+    failed = [r for r in results if not screen.measured(r)]
+    if failed:
+        return False, [{"code": "error", "message": failed[0]["error"]}], {"tools": results}
     malformed = [r for r in results if not r["format_ok"]]
     if malformed:
         return False, [{"code": "malformed_tool_calls", "malformed": len(malformed),
@@ -160,6 +168,16 @@ def triage_model(cfg: Config, client: Ollama, model: str, depth: int,
                    round(time.time() - started, 1), measured, noted)
 
 
+def rests_on_a_failure(rec: dict) -> bool:
+    """Whether an outcome was decided by a request that failed rather than by the model.
+
+    Such an outcome is worth reporting -- the run has to say why it stopped -- but
+    it is not a verdict, so running again measures the model rather than reading
+    the failure back.
+    """
+    return any(f.get("code") == "error" for f in rec.get("findings") or [])
+
+
 def read_ledger(cfg: Config) -> dict:
     """Each model's verdict, the newest of a repeated model winning."""
     return ledger.keyed(Path(cfg.results_dir) / LEDGER, lambda rec: rec["model"])
@@ -170,7 +188,8 @@ def run(cfg: Config, depth: int | None = None, redo: bool = False,
     depth = depth or working_depth(cfg.ctx)
     out = stream or sys.stdout
     models = cfg.resolve_models()
-    done = {} if redo else read_ledger(cfg)
+    done = {} if redo else {m: r for m, r in read_ledger(cfg).items()
+                            if not rests_on_a_failure(r)}
     path = cfg.path(LEDGER)
 
     gpulock.acquire("triage", endpoint=cfg.host)
@@ -201,9 +220,9 @@ def run(cfg: Config, depth: int | None = None, redo: bool = False,
 
     progress.summary(f"{len(models)} models: {len(cleared)} cleared, "
                      f"{len(rejected)} rejected", stream=out)
-    ledger = read_ledger(cfg)
+    verdicts = read_ledger(cfg)
     for model in rejected:
-        progress.note(f"{model}: {sentence(ledger.get(model, {}))}", stream=out)
+        progress.note(f"{model}: {sentence(verdicts.get(model, {}))}", stream=out)
     return 0
 
 

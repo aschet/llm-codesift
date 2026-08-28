@@ -4,9 +4,11 @@
 """JSON Lines stores, which is how every stage keeps what it measured.
 
 One record per line, written as it is taken, so an interrupted run keeps what it
-has already paid for. A line that will not parse is skipped rather than fatal: a
-run killed mid-write leaves a partial line behind, and every measurement before
-it is still good.
+has already paid for. Storing a record rewrites the file, which is why the file
+is replaced rather than overwritten: a rewrite killed halfway through would
+otherwise leave a truncated store, losing measurements that were already paid
+for rather than only the one being written. A line that will not parse is
+skipped rather than fatal.
 
 A record is identified by a key its own stage chooses -- a model and a window for
 the probe, a model and a task for the screen -- and writing one replaces whatever
@@ -15,6 +17,7 @@ was stored under that key, so a re-measurement supersedes rather than accumulate
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 
@@ -68,6 +71,14 @@ def replace(path: str | Path, rec: dict, key) -> None:
 
 
 def write(path: str | Path, records) -> None:
-    """Replace the file with these records."""
-    Path(path).write_text("".join(json.dumps(r) + "\n" for r in records),
-                          encoding="utf-8")
+    """Replace the file with these records, in one step.
+
+    Written beside the store and renamed over it. A rename is atomic, so a reader
+    sees either every record or none of the new ones, and a process killed during
+    the write leaves the store as it was.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+    os.replace(tmp, path)

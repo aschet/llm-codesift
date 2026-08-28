@@ -87,9 +87,12 @@ def read_model_file(path: str | os.PathLike) -> list[str]:
 
     A leading `ollama pull ` is stripped, which is what `discover --write-models`
     writes: the same file installs the candidates and then names them.
+
+    Read as utf-8-sig, because a file saved by Notepad opens with a byte order
+    mark and the first model would otherwise carry it into every request.
     """
     out = []
-    for line in Path(path).read_text(encoding="utf-8").splitlines():
+    for line in Path(path).read_text(encoding="utf-8-sig").splitlines():
         line = line.split("#", 1)[0].strip()
         if line.startswith(PULL_PREFIX):
             line = line[len(PULL_PREFIX):].strip()

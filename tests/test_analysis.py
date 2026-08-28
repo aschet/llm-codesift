@@ -108,3 +108,71 @@ class TestPartialDataIsNeverSuitable(RecordsCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestACategoryIsMeasuredLikeTheRateBesideIt(RecordsCase):
+    """The rate and the categories it is made of must count the same thing.
+
+    A code task scores the share of its assertions met, so the rate carries
+    partial credit. A category that counted only the tasks fully passed would sit
+    beside that rate reading lower, on a definition the column never states.
+    """
+
+    def field(self, records):
+        self.write_tasks([records])
+        self.write("probe.jsonl", [probe_record("m")])
+        return analysis.analyse(self.cfg, ["m"])
+
+    def part_marks(self):
+        """Ten code tasks, one of them half met, and two tool calls."""
+        out = [dict(model="m", run=1, ctx=65536, task=f"c{i}", kind="codegen",
+                    passed=i > 0, score=0.5 if i == 0 else 1.0, format_ok=True,
+                    detail="ok", wall=1.0, ts=1.0) for i in range(10)]
+        out += [dict(model="m", run=1, ctx=65536, task=f"t{i}", kind="toolcall",
+                     passed=True, score=1.0, format_ok=True, detail="ok",
+                     wall=0.5, ts=1.0) for i in range(2)]
+        return out
+
+    def test_the_category_carries_the_share_met_and_not_the_tasks_passed(self):
+        A = self.field(self.part_marks())
+        code = A.agg["m"]["kind"]["codegen"]
+        self.assertEqual(code["score"], 9.5)
+        self.assertEqual(code["n"], 10)
+        self.assertEqual(code["passed"], 9, "the count is kept for what gates on it")
+
+    def test_the_categories_add_up_to_the_rate(self):
+        A = self.field(self.part_marks())
+        kinds = A.agg["m"]["kind"].values()
+        met = sum(k["score"] for k in kinds)
+        tasks = sum(k["n"] for k in kinds)
+        self.assertAlmostEqual(round(100 * met / tasks, 1), A.agg["m"]["rate"])
+
+    def test_a_tool_call_that_took_an_extra_turn_is_still_the_right_tool(self):
+        # The turn costs it score, which the category shows. It did not call the
+        # wrong tool, and nothing may report that it did.
+        records = self.part_marks()
+        records[-1].update(score=0.5, turns=2)
+        A = self.field(records)
+        self.assertEqual(A.tool_stats("m"), (2, 2, 0))
+        self.assertNotIn("wrong_tool", [f["code"] for f in A.verdict("m")[1]])
+        self.assertEqual(A.agg["m"]["kind"]["toolcall"]["score"], 1.5)
+
+
+class TestARequestThatFailedCountsTowardsNothing(RecordsCase):
+    """A record of a dropped request is not a task the model got wrong."""
+
+    def field(self, extra):
+        self.write_tasks([screen_record("m", rate=100.0) + extra])
+        self.write("probe.jsonl", [probe_record("m")])
+        return analysis.analyse(self.cfg, ["m"])
+
+    def failure(self):
+        return [dict(model="m", run=1, ctx=65536, task="gone", kind="codegen",
+                     error="OSError: Connection reset by peer", wall=None, ts=1.0)]
+
+    def test_it_does_not_drag_the_rate_down(self):
+        self.assertEqual(self.field(self.failure()).agg["m"]["rate"], 100.0)
+
+    def test_it_is_not_counted_as_a_task_that_was_measured(self):
+        A = self.field(self.failure())
+        self.assertEqual(A.agg["m"]["n"], len(screen_record("m")))

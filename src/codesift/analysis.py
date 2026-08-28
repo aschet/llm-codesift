@@ -14,7 +14,7 @@ from collections import defaultdict
 from . import ledger
 from .config import Config
 from .probe import at_depth, long_prompt
-from .screen import _score
+from .screen import _score, measured
 
 # Speed is judged in two places. Triage rejects a model that generates too slowly to
 # be used at all; the report compares what is left on a modelled coding session, built
@@ -41,19 +41,26 @@ USER_TOKENS = 100
 def _aggregate(by_model: dict) -> dict:
     """Each model's task records reduced to the figures the page reports."""
     out = {}
-    for m, v in by_model.items():
+    for m, records in by_model.items():
+        # A request that failed holds no answer, so it counts towards nothing here.
+        v = [t for t in records if measured(t)]
         # A model measured on a handful of tasks has no comparable rate; the
         # figure would move with which tasks happened to be run.
         if len(v) < 10:
             continue
-        kind = defaultdict(lambda: [0, 0])
+        # Both readings of a category, because they answer different questions: the
+        # share met is what the rate beside it is made of, and the count of tasks
+        # fully passed is what a gate on a capability can be decided on.
+        kind = defaultdict(lambda: {"score": 0.0, "n": 0, "passed": 0})
         # A task whose output could not be parsed at all is counted separately from
         # one that parsed and was wrong: for tool calls the two mean very different
         # things to a harness, and only the first ends a session.
         malformed = defaultdict(int)
         for t in v:
-            kind[t["kind"]][1] += 1
-            kind[t["kind"]][0] += bool(t["passed"])
+            k = kind[t["kind"]]
+            k["n"] += 1
+            k["score"] += _score(t)
+            k["passed"] += bool(t["passed"])
             if not t.get("format_ok", True):
                 malformed[t["kind"]] += 1
         walls = sorted(t["wall"] for t in v if t.get("wall"))
@@ -109,7 +116,7 @@ class Assessment:
         """Tool-call results: (passed, total, malformed)."""
         a = self.agg.get(m, {})
         k = a.get("kind", {}).get("toolcall")
-        passed, total = (k[0], k[1]) if k and k[1] else (0, 0)
+        passed, total = (k["passed"], k["n"]) if k and k["n"] else (0, 0)
         return passed, total, a.get("malformed", {}).get("toolcall", 0)
 
     def session_time(self, m: str) -> float | None:

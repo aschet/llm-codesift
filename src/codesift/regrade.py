@@ -43,7 +43,7 @@ def task_for(rec: dict) -> dict | None:
 
 
 def truncated(raw: str) -> bool:
-    return len(raw) >= OLD_RAW_CAP and len(raw) in (OLD_RAW_CAP, RAW_KEPT)
+    return len(raw) in (OLD_RAW_CAP, RAW_KEPT)
 
 
 def regrade(rec: dict) -> tuple[dict, str]:

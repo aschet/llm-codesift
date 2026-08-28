@@ -123,16 +123,16 @@ def measure(client: Ollama, model: str, ctx: int, depth: int, deep: bool = True)
     rec["chars_per_token"] = round(ratio, 2)
     prompt = build_prompt(depth, ratio)
     try:
-        deep = client.chat(model, prompt, ctx=ctx, num_predict=DEEP_PREDICT)
+        reply = client.chat(model, prompt, ctx=ctx, num_predict=DEEP_PREDICT)
     except Exception as exc:
         rec["error"] = f"deep: {type(exc).__name__}: {exc}"
         return rec
-    rec["prefill_s"] = round(deep.get("prompt_eval_duration", 0) / 1e9, 1)
+    rec["prefill_s"] = round(reply.get("prompt_eval_duration", 0) / 1e9, 1)
 
     # What the server says it read, which is the depth this was measured at. The
     # target is what was asked for; a prompt the window could not hold is cut
     # without a word, and the difference between the two is how that shows.
-    processed = deep.get("prompt_eval_count")
+    processed = reply.get("prompt_eval_count")
     rec["depth_tokens"] = processed
     rec["likely_truncated"] = bool(processed and processed < depth * 0.9)
     return rec

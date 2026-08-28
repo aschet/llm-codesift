@@ -217,9 +217,6 @@ PAGE = """<title>Local Coding Model Evaluation</title>
 
 {pass_rate}
 {speed}
-
-
-
 </div>
 """
 
@@ -257,9 +254,10 @@ def _pass_rate(A):
         ks = ""
         for k in KIND_ORDER:
             v = kind.get(k)
-            have = bool(v and v[1])
-            title = f"{v[0]:.0f} of {v[1]} tasks" if have else "no tasks of this kind"
-            figure = f"{100 * v[0] / v[1]:.0f}" if have else "&mdash;"
+            have = bool(v and v["n"])
+            title = (f"{v['score']:.1f} of {v['n']} tasks met" if have
+                     else "no tasks of this kind")
+            figure = f"{100 * v['score'] / v['n']:.0f}" if have else "&mdash;"
             ks += (f'<span class="kv" title="{title}">'
                    f'<i>{k[:4]}</i><b>{figure}</b></span>')
         body += (f'<tr class="r-plain"><th>{esc(m)}</th>'
@@ -268,11 +266,11 @@ def _pass_rate(A):
                  f'<td class="kinds"><div class="kindwrap">{ks}</div></td></tr>')
     return f'''<section><h2>Pass Rate</h2>
 <div class="lede"><p>Python coding tasks, highest first. Each answer is executed against
-assertions rather than compared to a reference, at temperature 0, once per task. The
-categories: <code>code</code> writes from a specification, <code>edit</code> repairs existing
-source, <code>form</code> obeys output constraints, <code>tool</code> emits calls with
-correctly typed arguments, <code>trac</code> predicts what a program prints. The counts behind
-each category figure are on hover.</p></div>
+assertions rather than compared to a reference, at temperature 0, once per task, and scores
+the share of them it meets. The categories: <code>code</code> writes from a specification,
+<code>edit</code> repairs existing source, <code>form</code> obeys output constraints,
+<code>tool</code> emits calls with correctly typed arguments, <code>trac</code> predicts what
+a program prints. What each category figure is drawn from is on hover.</p></div>
 <div class="scroll"><table><thead><tr><th>Model</th><th>Pass rate <span class="unit">%</span></th>
 <th>Median per task <span class="unit">s</span></th>
 <th>By category <span class="unit">%</span></th></tr></thead>
@@ -285,12 +283,11 @@ def _speed(A, probe_depth):
         rs = ""
         for m in sorted(A.prb, key=lambda x: (A.session_time(x) or 9e9)):
             d = A.prb[m]
-            sev = "plain"
             # Rates, and the session they add up to. What the model did with a long
             # prompt is a finding, and the ranking carries it; a column of it read
             # OK on every row but one. A model stopped before the deep prompt has
             # no session and no wait, and the empty cells say so.
-            rs += (f'<tr class="r-{sev}"><th>{esc(m)}</th>'
+            rs += (f'<tr class="r-plain"><th>{esc(m)}</th>'
                    f'<td class="figure strong">{num(A.session_time(m),"",0)}</td>'
                    f'<td class="figure">{num(d.get("prefill_s"),"",1)}</td>'
                    f'<td class="figure">{num(d.get("gen_tok_s"),"",1)}</td>'

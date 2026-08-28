@@ -94,7 +94,16 @@ class Reporter:
         return " " * (self.stack[-1].depth * STEP + extra)
 
     def _say(self, text: str, stream=None) -> None:
-        print(text, file=stream or sys.stdout, flush=True)
+        out = stream or sys.stdout
+        try:
+            print(text, file=out, flush=True)
+        except UnicodeEncodeError:
+            # Redirected output takes the system encoding, which on Windows is
+            # not UTF-8. A character it cannot spell is worth an escape in the
+            # log, and is not worth ending a sweep for.
+            encoding = getattr(out, "encoding", None) or "ascii"
+            print(text.encode(encoding, "backslashreplace").decode(encoding),
+                  file=out, flush=True)
 
     def _point(self, ok: bool, description: str, diagnostics: dict | None = None,
                stream=None) -> None:

@@ -9,8 +9,10 @@ anything already measured.
 from __future__ import annotations
 
 import ast
+import contextlib
 import json
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -145,6 +147,21 @@ print("RESULT", passed, failed, first)
 """
 
 
+@contextlib.contextmanager
+def _scratch():
+    """A directory to run a candidate in, removed however the attempt ends.
+
+    Not TemporaryDirectory: a process killed at the timeout can still hold its
+    working directory for a moment on Windows, and the removal would then raise
+    out of the grader instead of the task simply scoring nothing.
+    """
+    path = tempfile.mkdtemp(prefix="codesift-")
+    try:
+        yield Path(path)
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+
+
 def run_checks(code: str, tests: str) -> tuple[int, int, str]:
     """Return (checks met, checks total, what the first shortfall was).
 
@@ -159,12 +176,12 @@ def run_checks(code: str, tests: str) -> tuple[int, int, str]:
     if not code.strip():
         return 0, 1, "empty"
     script = ("CODE = " + repr(code) + "\nTESTS = " + repr(tests) + "\n" + _PER_CHECK)
-    with tempfile.TemporaryDirectory() as td:
-        path = Path(td) / "checks.py"
+    with _scratch() as td:
+        path = td / "checks.py"
         path.write_text(script, encoding="utf-8")
         try:
             proc = subprocess.run([sys.executable, str(path)], capture_output=True,
-                                  text=True, timeout=EXEC_TIMEOUT, cwd=td)
+                                  text=True, timeout=EXEC_TIMEOUT, cwd=str(td))
         except subprocess.TimeoutExpired:
             return 0, 1, "timeout"
     for line in (proc.stdout or "").splitlines():
@@ -186,12 +203,12 @@ def run_tests(code: str, tests: str) -> tuple[bool, str]:
     if not code.strip():
         return False, "empty"
     script = f"{code}\n\n{tests}\nprint('__PASS__')\n"
-    with tempfile.TemporaryDirectory() as td:
-        path = Path(td) / "candidate.py"
+    with _scratch() as td:
+        path = td / "candidate.py"
         path.write_text(script, encoding="utf-8")
         try:
             proc = subprocess.run([sys.executable, str(path)], capture_output=True,
-                                  text=True, timeout=EXEC_TIMEOUT, cwd=td)
+                                  text=True, timeout=EXEC_TIMEOUT, cwd=str(td))
         except subprocess.TimeoutExpired:
             return False, "timeout"
     if "__PASS__" in proc.stdout:
@@ -248,17 +265,17 @@ def grade(task: dict, response: dict) -> tuple[bool, bool, str, float]:
         if fn.get("name") != want:
             return False, True, f"called={fn.get('name')}, wanted={want}", 0.0
         for key, typ in (task.get("want_args") or {}).items():
-            args = fn.get("arguments")
-            if isinstance(args, str):
+            given = fn.get("arguments")
+            if isinstance(given, str):
                 try:
-                    args = json.loads(args)
+                    given = json.loads(given)
                 except Exception:
                     return False, False, "arguments not valid JSON", 0.0
-            args = args or {}
-            if key not in args:
+            given = given or {}
+            if key not in given:
                 return False, True, f"missing arg {key!r}", 0.0
-            if not isinstance(args[key], typ):
-                return False, True, f"arg {key!r} is {type(args[key]).__name__}", 0.0
+            if not isinstance(given[key], typ):
+                return False, True, f"arg {key!r} is {type(given[key]).__name__}", 0.0
         return True, True, f"called={fn.get('name')}", 1.0
 
     if kind == "format":
@@ -315,7 +332,7 @@ def run_turns(client, model: str, task: dict, *, ctx: int,
     if task["kind"] == "edit":
         prompt = f"{prompt}\n\n```python\n{task['code']}\n```"
     messages = [{"role": "user", "content": prompt}]
-    budget, wall = task.get("turns", 1), 0.0
+    budget, wall = max(1, task.get("turns", 1)), 0.0
     for turn in range(1, budget + 1):
         resp = client.chat(model, messages if turn > 1 else prompt, ctx=ctx,
                            num_predict=num_predict, tools=task.get("tools"))
@@ -329,7 +346,6 @@ def run_turns(client, model: str, task: dict, *, ctx: int,
             return resp, turn
         messages = messages + [message, {"role": "tool", "tool_name": name,
                                          "content": json.dumps(served)}]
-    return resp, budget
 
 
 def key(rec: dict) -> tuple:
@@ -352,21 +368,26 @@ def measure_tasks(client, cfg: Config, model: str, run_idx: int,
     twice: whichever gets there first records the result, and the other finds it
     already done. A record here is a measurement wherever it came from.
 
-    Tasks already present in `done` are returned from it untouched.
+    Tasks already measured in `done` are returned from it untouched. A task whose
+    request failed is not one of them: it is asked again, since what is on record
+    is the failure and not an answer.
     """
     records = []
     for task in tasks:
         ident = (model, run_idx, task["id"])
-        if ident in done:
+        if ident in done and measured(done[ident]):
             records.append(done[ident])
             continue
         try:
             resp, turns = run_turns(client, model, task, ctx=cfg.ctx,
                                     num_predict=num_predict)
         except Exception as exc:
-            rec = dict(model=model, run=run_idx, ctx=cfg.ctx,
-                       task=task["id"], kind=task["kind"], passed=False, score=0.0,
-                       format_ok=False, detail=f"{type(exc).__name__}: {exc}",
+            # The request failed, so the model said nothing to grade. Recorded as
+            # the failure it is rather than as an empty answer: an unanswered task
+            # scored zero and marked unparseable reads, everywhere downstream, as a
+            # model that replied badly.
+            rec = dict(model=model, run=run_idx, ctx=cfg.ctx, task=task["id"],
+                       kind=task["kind"], error=f"{type(exc).__name__}: {exc}",
                        wall=None, ts=time.time())
         else:
             passed, parseable, detail, score = grade(task, resp)
@@ -396,8 +417,9 @@ def measure_tasks(client, cfg: Config, model: str, run_idx: int,
         # A test point is all-or-nothing and a code task is not, so the share of
         # assertions met rides along in the diagnostics.
         progress.unit("screen", task["id"],
-                      progress.OK if rec["passed"] else progress.FAIL,
-                      rec["wall"] or 0.0, rec["detail"][:60],
+                      progress.OK if measured(rec) and rec["passed"] else progress.FAIL,
+                      rec["wall"] or 0.0,
+                      (rec.get("detail") or rec.get("error") or "")[:60],
                       score=rec.get("score"))
     return records
 
@@ -430,7 +452,8 @@ def run(cfg: Config, num_predict: int = NUM_PREDICT, redo: bool = False,
     models = cfg.resolve_models()
     for i, model in enumerate(models, 1):
         pending = [t for t in selected
-                   if (model, RUN, t["id"]) not in done]
+                   if (model, RUN, t["id"]) not in done
+                   or not measured(done[(model, RUN, t["id"])])]
         if pending:
             progress.subject(i, len(models), model, f"{len(pending)} task(s) to run")
         else:
@@ -446,6 +469,15 @@ def run(cfg: Config, num_predict: int = NUM_PREDICT, redo: bool = False,
             client.unload(model)
 
 
+def measured(rec: dict) -> bool:
+    """Whether this record holds an answer, as opposed to a request that failed.
+
+    A failed request is on file so the run can say what happened, and it is not a
+    measurement of the model: it counts towards no rate and settles no gate.
+    """
+    return not rec.get("error")
+
+
 def _score(rec: dict) -> float:
     got = rec.get("score")
     return float(got) if got is not None else float(bool(rec.get("passed")))
@@ -453,6 +485,8 @@ def _score(rec: dict) -> float:
 
 def _report(model: str, records: list[dict]) -> None:
     """Say how the model did, from the records themselves."""
+    failed = [r for r in records if not measured(r)]
+    records = [r for r in records if measured(r)]
     n = len(records) or 1
     passed = sum(1 for r in records if r["passed"])
     rate = round(100 * sum(_score(r) for r in records) / n, 1)
@@ -463,6 +497,7 @@ def _report(model: str, records: list[dict]) -> None:
     # which rather than printing them as one figure and its percentage.
     progress.result(f"scored {rate}%, {passed} of {len(records)} tasks fully passed, "
                     f"parseable {parseable}%"
+                    + (f", {len(failed)} task(s) unmeasured" if failed else "")
                     + (f", WARNING: {capped} replies hit the token cap" if capped else ""))
 
 

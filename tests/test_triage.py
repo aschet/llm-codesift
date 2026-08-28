@@ -38,13 +38,18 @@ ANSWERS = {task["prompt"]: reference.perfect_answer(task)
 class FakeClient:
     """A model whose behaviour at each gate is dictated by the test."""
 
-    def __init__(self, gen=60.0, tool_ok=True, answers_well=True, truncated=False):
+    def __init__(self, gen=60.0, tool_ok=True, answers_well=True, truncated=False,
+                 drops=0):
         self.gen, self.tool_ok = gen, tool_ok
         self.answers_well, self.truncated = answers_well, truncated
         self.deep_calls = 0
         self.task_calls = 0
+        self.drops = drops          # requests to fail before answering any
 
     def chat(self, model, prompt, ctx=None, num_predict=None, tools=None):
+        if tools and self.drops:
+            self.drops -= 1
+            raise OSError("Connection reset by peer")
         if "codebase excerpt" in prompt:                  # the deep probe
             self.deep_calls += 1
             return {"message": {"content": "OK"}, "_wall": 1.0,
@@ -98,6 +103,38 @@ class TriageCase(unittest.TestCase):
         progress.py's business and changes without any of this changing.
         """
         return [f["code"] for f in self.ledger()[model]["findings"]]
+
+
+class TestARequestThatFailedIsNotAnAnswer(TriageCase):
+    """A dropped request measures nothing, and must not be read as a bad reply.
+
+    The two arrive at the same place -- no usable answer -- and mean opposite
+    things. A model that emits a call the harness cannot parse is unusable; one
+    whose connection dropped has not been asked yet.
+    """
+
+    def test_a_dropped_request_is_not_reported_as_an_unparseable_tool_call(self):
+        self.go(FakeClient(drops=1))
+        self.assertEqual(self.codes(), ["error"])
+
+    def test_the_next_run_asks_again_rather_than_reading_the_failure_back(self):
+        first = FakeClient(drops=1)
+        self.go(first)
+        second = FakeClient()
+        self.go(second)
+        self.assertGreater(second.task_calls, 0, "the model was never asked again")
+        self.assertEqual(self.codes(), [], "nothing was found against it")
+        self.assertTrue(self.ledger()["m:1"]["passed"])
+
+    def test_the_task_that_failed_is_not_left_on_file_as_a_measurement(self):
+        self.go(FakeClient(drops=1))
+        graded = [json.loads(l) for l in
+                  (self.tmp / "screen_tasks.jsonl").read_text().splitlines()]
+        failed = [r for r in graded if not screen.measured(r)]
+        self.assertTrue(failed, "the failure itself must be on record")
+        for rec in failed:
+            self.assertNotIn("passed", rec)
+            self.assertNotIn("format_ok", rec)
 
 
 class TestEarlyExit(TriageCase):

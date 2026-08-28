@@ -3,13 +3,15 @@
 # SPDX-License-Identifier: MIT
 """The store every stage keeps its measurements in.
 
-What matters is that a damaged line costs only itself, and that writing a record
-replaces the one it supersedes instead of joining it.
+What matters is that a damaged line costs only itself, that writing a record
+replaces the one it supersedes instead of joining it, and that a write killed
+partway through costs nothing that was already measured.
 """
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from codesift import ledger
 
@@ -88,3 +90,40 @@ class TestReplacing(LedgerCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestWritingIsAllOrNothing(LedgerCase):
+    """Storing a record rewrites the file, and a rewrite can be interrupted.
+
+    Every measurement already on file is paid for in minutes of GPU time, so the
+    one being written is the most a run may lose by dying at the wrong moment.
+    """
+
+    def test_a_write_killed_partway_through_leaves_the_store_as_it_was(self):
+        self.put(*({"name": f"m{i}"} for i in range(200)))
+        real = Path.write_text
+
+        def killed(path, text, **kw):
+            real(path, text[:len(text) // 3], **kw)
+            raise KeyboardInterrupt
+
+        with mock.patch.object(Path, "write_text", killed):
+            with self.assertRaises(KeyboardInterrupt):
+                ledger.replace(self.path, {"name": "m200"}, BY_NAME)
+        self.assertEqual(len(ledger.read(self.path)), 200)
+
+    def test_a_reader_never_sees_a_half_written_store(self):
+        # The store is replaced by a rename, so what a reader opens is either the
+        # old file entire or the new one, never a file being filled in.
+        self.put({"name": "a"})
+        seen = []
+        real = Path.write_text
+
+        def watching(path, text, **kw):
+            seen.append([r["name"] for r in ledger.read(self.path)])
+            return real(path, text, **kw)
+
+        with mock.patch.object(Path, "write_text", watching):
+            ledger.replace(self.path, {"name": "b"}, BY_NAME)
+        self.assertEqual(seen, [["a"]])
+        self.assertEqual([r["name"] for r in ledger.read(self.path)], ["a", "b"])
