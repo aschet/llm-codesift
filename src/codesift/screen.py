@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -26,6 +27,16 @@ from .ollama import Ollama
 from .tasks import TASKS
 
 EXEC_TIMEOUT = 15
+
+# A candidate's own stdout is otherwise encoded with whatever the platform's
+# locale defaults to -- cp1252 on Windows, and conceivably ASCII in a bare POSIX
+# locale -- and a model demonstrating its answer with so much as a checkmark then
+# crashes the interpreter before any check runs. Read back with the same fixed
+# encoding, since a parent decoding what the child wrote as UTF-8 through its own
+# locale can itself fail: capture_output runs that decode on a background thread,
+# where the error surfaces as noise on the real stderr rather than a result the
+# caller can catch, and the task is left looking like it produced no output.
+_CHILD_ENV = {**os.environ, "PYTHONIOENCODING": "utf-8"}
 
 # The budget covers a model's reasoning as well as its answer, and exists to stop a
 # runaway rather than to constrain a legitimate reply. It is roughly 2.5 times the
@@ -47,7 +58,11 @@ def _declarations_only(code: str) -> str:
     A bare expression at the top level -- `print(divide(10, 0))`, `flaky_call()` --
     is a demonstration. It is not part of the answer, and running it alongside the
     tests grades the model on its illustration; one that fails at random would also
-    make the result differ between runs of identical input.
+    make the result differ between runs of identical input. A top-level `for` or
+    `while` loop is the same habit spelled out longer -- a model showing its work
+    by calling the function over some sample inputs and printing the result -- and
+    is dropped for the same reason: it can fail or print output unrelated to
+    whether the answer itself is correct.
 
     Everything that declares something is kept, in order, so imports introduced
     beside a first attempt remain available to the version that supersedes it, and
@@ -63,6 +78,8 @@ def _declarations_only(code: str) -> str:
     for node in tree.body:
         if isinstance(node, ast.Expr):
             continue                      # a bare call, or a stray docstring
+        if isinstance(node, (ast.For, ast.While)):
+            continue                      # a self-test loop demonstrating the answer
         if isinstance(node, ast.If) and _is_main_guard(node):
             continue                      # a demonstration behind a guard
         keep.append(node)
@@ -181,7 +198,8 @@ def run_checks(code: str, tests: str) -> tuple[int, int, str]:
         path.write_text(script, encoding="utf-8")
         try:
             proc = subprocess.run([sys.executable, str(path)], capture_output=True,
-                                  text=True, timeout=EXEC_TIMEOUT, cwd=str(td))
+                                  encoding="utf-8", errors="replace",
+                                  timeout=EXEC_TIMEOUT, cwd=str(td), env=_CHILD_ENV)
         except subprocess.TimeoutExpired:
             return 0, 1, "timeout"
     for line in (proc.stdout or "").splitlines():
@@ -208,7 +226,8 @@ def run_tests(code: str, tests: str) -> tuple[bool, str]:
         path.write_text(script, encoding="utf-8")
         try:
             proc = subprocess.run([sys.executable, str(path)], capture_output=True,
-                                  text=True, timeout=EXEC_TIMEOUT, cwd=str(td))
+                                  encoding="utf-8", errors="replace",
+                                  timeout=EXEC_TIMEOUT, cwd=str(td), env=_CHILD_ENV)
         except subprocess.TimeoutExpired:
             return False, "timeout"
     if "__PASS__" in proc.stdout:

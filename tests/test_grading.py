@@ -259,6 +259,25 @@ class TestCodeExtraction(unittest.TestCase):
                                           "assert f() == 5\n")
         self.assertTrue(passed, detail)
 
+    def test_a_self_test_loop_is_not_executed(self):
+        # Observed against qwen3.5:9b: a correct normalise_path, followed by a
+        # top-level for-loop printing a checkmark or cross per example. Two
+        # things went wrong at once -- the loop ran as part of "the answer"
+        # exactly as a bare `print(divide(10, 0))` already did, and on Windows
+        # printing the checkmark then crashed the interpreter outright, since a
+        # subprocess's stdout defaults to the platform locale (cp1252) rather
+        # than an encoding that can spell it. Either fault alone would have
+        # failed this on a model that got the real answer right.
+        reply = ("```python\ndef double(x):\n    return x * 2\n```\n"
+                 "Verified against a few cases:\n"
+                 "```python\nfor x, want in [(1, 2), (2, 4)]:\n"
+                 "    got = double(x)\n"
+                 "    print('✓' if got == want else '✗')\n```")
+        code = screen.extract_code(reply, "double")
+        self.assertNotIn("for x, want", code)
+        passed, detail = screen.run_tests(code, "assert double(3) == 6\n")
+        self.assertTrue(passed, detail)
+
     def test_code_that_will_not_parse_is_handed_to_the_grader_as_written(self):
         # The syntax error is the finding; hiding it behind a fallback would
         # report something else instead.
