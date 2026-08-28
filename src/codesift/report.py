@@ -427,8 +427,10 @@ def build(cfg: Config, models: list[str]) -> str:
     depths = sorted({r.get("depth_target") for r in A.probe if r.get("depth_target")})
     probe_depth = ", ".join(f"{d:,}" for d in depths) if depths else "the configured depth"
 
-    # The tool that produced the page, not the server it talked to. The host appears
-    # only when it is remote, where it explains why there are no GPU details.
+    # The tool that produced the page, not the server it talked to. The host
+    # appears only when it is remote, since naming your own machine back to you
+    # would be noise; GPU and memory figures come from the server itself either
+    # way, through Ollama's /api/ps, so nothing here depends on being local.
     envline = " \u00b7 ".join(filter(None, [
         "codesift", "Ollama", (f"remote host {cfg.host}" if cfg.is_remote else "")]))
     return PAGE.format(
