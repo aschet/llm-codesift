@@ -1,54 +1,46 @@
+# SPDX-FileCopyrightText: 2026 Thomas Ascher <thomas.ascher@gmx.at>
+#
+# SPDX-License-Identifier: MIT
 """The report must render from whatever records exist, including none.
 
 A reporting step that crashes on sparse data loses the measurements that were
 successfully collected, so the degenerate cases are exercised explicitly.
 """
-import io
 import json
 import re
 import tempfile
 import unittest
 from pathlib import Path
 
-from codesift import report
+from codesift import analysis, report
 from codesift.config import Config
-
-# Refused immediately rather than timing out, so tests stay fast offline.
-OFFLINE = "http://127.0.0.1:1"
-
-
-def screen_record(model, taskset="basic", run=1, rate=100.0):
-    tasks = [
-        dict(task="t1", kind="codegen", passed=rate >= 50, format_ok=True,
-             detail="ok", wall=1.0),
-        dict(task="t2", kind="toolcall", passed=True, format_ok=True,
-             detail="ok", wall=0.5),
-    ]
-    return dict(model=model, run=run, taskset=taskset, ctx=65536, n=14,
-                passed=int(rate / 100 * 14), pass_rate=rate, format_ok_rate=100.0,
-                hit_cap_n=0, median_wall=1.0, total_s=10.0, tasks=tasks)
+from codesift.findings import sentence
+from tests.records import OFFLINE, RecordsCase, probe_record, screen_record
 
 
-def probe_record(model, prefill=60.0, gen=45.0, truncated=False, retrieved=True,
-                 moe=True, pct_gpu=40.0):
-    return dict(model=model, num_ctx=65536, gen_tok_s=gen, prefill_tok_s=800.0,
-                prefill_s=prefill, prefill_toks=48000, likely_truncated=truncated,
-                retrieved=retrieved, placement={"pct_gpu": pct_gpu}, moe=moe)
 
 
-class ReportCase(unittest.TestCase):
-    def setUp(self):
-        self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.cfg = Config(host=OFFLINE, results_dir=self.tmp)
 
-    def write(self, name, records):
-        with (self.tmp / name).open("w", encoding="utf-8") as fh:
-            for rec in records:
-                fh.write(json.dumps(rec) + "\n")
+
+class ReportCase(RecordsCase):
+    """Records, plus the page built from them."""
 
     def render(self, models=None):
         out = report.run(self.cfg, self.tmp / "report.html", models)
         return out.read_text(encoding="utf-8")
+
+    def assessed(self, html):
+        """Where a verdict and its finding live: the one table over the field."""
+        return html.split("<h2>Ranking</h2>", 1)[1].split("<h2>", 1)[0]
+
+    def row(self, section, model):
+        """One model's row, from <th>model</th> to the end of that row."""
+        start = section.index(f"<th>{model}</th>")
+        return section[section.rindex("<tr", 0, start):section.index("</tr>", start)]
+
+    def picks(self, html):
+        """The recommendation cards, which only measured models can appear in."""
+        return html.split("<h2>Recommendation</h2>", 1)[1].split("</section>", 1)[0]
 
 
 class TestDegenerateInputs(ReportCase):
@@ -58,27 +50,27 @@ class TestDegenerateInputs(ReportCase):
         self.assertIn("</div>", html)
 
     def test_single_model_with_full_data(self):
-        self.write("screen.jsonl", [screen_record("solo", "basic"),
-                                    screen_record("solo", "hard")])
+        self.write_tasks([screen_record("solo")])
         self.write("probe.jsonl", [probe_record("solo")])
         html = self.render(["solo"])
         self.assertIn("solo", html)
-        self.assertIn("Speed at Working Depth", html)
+        self.assertIn("<h2>Speed</h2>", html)
 
     def test_screen_only_without_probe(self):
-        self.write("screen.jsonl", [screen_record("a"), screen_record("b", rate=60.0)])
+        self.write_tasks([screen_record("a"), screen_record("b", rate=60.0)])
         html = self.render(["a", "b"])
-        self.assertIn("Basic Set", html)
-        self.assertNotIn("Speed at Working Depth", html)
+        self.assertIn("<h2>Pass Rate</h2>", html)
+        self.assertNotIn("<h2>Speed</h2>", html)
+        self.assertNotIn("Speed below", html)
 
 
 class TestContent(ReportCase):
     def setUp(self):
         super().setUp()
-        self.write("screen.jsonl", [
-            screen_record("good", "basic"), screen_record("good", "hard"),
-            screen_record("weak", "basic", rate=50.0),
-            screen_record("weak", "hard", rate=50.0)])
+        self.write_tasks([
+            screen_record("good"), screen_record("good"),
+            screen_record("weak", rate=50.0),
+            screen_record("weak", rate=50.0)])
         self.write("probe.jsonl", [probe_record("good"), probe_record("weak", prefill=200.0)])
 
     def test_models_not_requested_are_excluded(self):
@@ -88,7 +80,7 @@ class TestContent(ReportCase):
 
     def test_truncating_model_is_marked_unsuitable(self):
         self.write("probe.jsonl", [probe_record("good"),
-                                   probe_record("weak", truncated=True, retrieved=False)])
+                                   probe_record("weak", truncated=True)])
         html = self.render(["good", "weak"])
         self.assertIn("unsuitable", html)
 
@@ -118,37 +110,37 @@ class TestFailingModels(ReportCase):
     """
 
     def test_single_model_failing_everything(self):
-        self.write("screen.jsonl", [screen_record("bad", "basic", rate=0.0),
-                                    screen_record("bad", "hard", rate=0.0)])
+        self.write_tasks([screen_record("bad", rate=0.0),
+                                    screen_record("bad", rate=0.0)])
         self.write("probe.jsonl", [probe_record("bad", prefill=500.0, gen=1.0,
-                                                truncated=True, retrieved=False)])
+                                                truncated=True)])
         html = self.render(["bad"])
         self.assertIn("bad", html)
         self.assertIn("unsuitable", html)
-        self.assertIn("No model cleared", html,
+        self.assertIn("No model can be recommended", html,
                       "with nothing eligible the recommendation must say so")
 
-    def test_every_model_excluded_by_gates(self):
-        self.write("screen.jsonl", [screen_record(m, ts, rate=0.0)
-                                    for m in ("a", "b") for ts in ("basic", "hard")])
-        self.write("probe.jsonl", [probe_record("a", truncated=True, retrieved=False),
-                                   probe_record("b", truncated=True, retrieved=False)])
+    def test_every_model_excluded(self):
+        # Unparseable tool calls: a harness cannot proceed at all, which is what
+        # it takes to be excluded rather than merely limited.
+        self.write_tasks([screen_record(m, rate=0.0, tools_ok=False)
+                          for m in ("a", "b")])
+        self.write("probe.jsonl", [probe_record("a"), probe_record("b")])
         html = self.render(["a", "b"])
-        self.assertIn("No model cleared", html)
+        self.assertIn("No model can be recommended", html)
 
     def test_single_model_passing_everything(self):
         """Normalisation across one model divides by a zero range."""
-        self.write("screen.jsonl", [screen_record("solo", "basic"),
-                                    screen_record("solo", "hard")])
+        self.write_tasks([screen_record("solo")])
         self.write("probe.jsonl", [probe_record("solo")])
         html = self.render(["solo"])
-        self.assertIn("Full Ranking", html)
+        self.assertIn("<h2>Ranking</h2>", html)
         self.assertIn("solo", html)
 
     def test_zero_generation_rate(self):
         """A model that produced no measurable output must not divide by zero."""
-        self.write("screen.jsonl", [screen_record("stalled", "basic"),
-                                    screen_record("stalled", "hard")])
+        self.write_tasks([screen_record("stalled"),
+                                    screen_record("stalled")])
         self.write("probe.jsonl", [probe_record("stalled", gen=0.0)])
         html = self.render(["stalled"])
         self.assertIn("stalled", html)
@@ -156,10 +148,10 @@ class TestFailingModels(ReportCase):
     def test_probe_without_any_screen_records(self):
         self.write("probe.jsonl", [probe_record("only-probed")])
         html = self.render(["only-probed"])
-        self.assertIn("Speed at Working Depth", html)
+        self.assertIn("<h2>Speed</h2>", html)
 
     def test_records_for_unknown_models_are_ignored(self):
-        self.write("screen.jsonl", [screen_record("ghost", "basic")])
+        self.write_tasks([screen_record("ghost")])
         html = self.render(["someone-else"])
         self.assertNotIn("ghost", html)
 
@@ -191,62 +183,167 @@ class TestRejectedAreNamed(unittest.TestCase):
         report.run(Config(results_dir=self.tmp, models=models), out, models)
         return out.read_text(encoding="utf-8")
 
-    def test_a_rejected_model_is_named_with_its_gate_and_reason(self):
+    def assessed(self, html):
+        return html.split("<h2>Ranking</h2>", 1)[1].split("<h2>", 1)[0]
+
+    def row(self, section, model):
+        start = section.index(f"<th>{model}</th>")
+        return section[section.rindex("<tr", 0, start):section.index("</tr>", start)]
+
+    def test_a_rejected_model_is_named_with_what_it_was_rejected_for(self):
         self.write("triage.jsonl", [
-            dict(model="slow:1", passed=False, gate="speed",
-                 detail="generates 9 tok/s", seconds=11.0, ts=1.0),
+            dict(model="slow:1", passed=False, findings=[{"code": "slow_generation", "tok_s": 9.0}], ts=1.0),
         ])
         page = self.render(["slow:1"])
-        self.assertIn("Ruled Out Before Scoring", page)
         self.assertIn("slow:1", page)
-        self.assertIn("speed", page)
-        self.assertIn("generates 9 tok/s", page)
+        self.assertIn("9 tok/s", page)
 
-    def test_only_the_gate_that_decided_it_is_shown(self):
-        # Later gates never ran; reporting them would invent measurements.
+    def test_the_newest_verdict_is_the_one_shown(self):
+        # One run writes one record holding every finding it reached, so two
+        # records mean two runs and the later one is what is true now.
         self.write("triage.jsonl", [
-            dict(model="m:1", passed=True, gate="speed", detail="ok",
-                 seconds=1.0, ts=1.0),
-            dict(model="m:1", passed=False, gate="quality",
-                 detail="hard-set 60%", seconds=70.0, ts=2.0),
+            dict(model="m:1", passed=False,
+                 findings=[{"code": "slow_generation", "tok_s": 9.0}], ts=1.0),
+            dict(model="m:1", passed=False,
+                 findings=[{"code": "malformed_tool_calls", "malformed": 2, "total": 4}],
+                 ts=2.0),
         ])
         page = self.render(["m:1"])
-        self.assertIn("hard-set 60%", page)
-        self.assertEqual(page.count("<th>m:1</th>"), 1)
+        self.assertIn("50% of tool calls unparseable", page)
+        self.assertNotIn("9 tok/s", page)
 
-    def test_a_rejected_model_also_gets_an_assessment_card(self):
-        # It was assessed, and the verdict is unsuitable; leaving it out of the
-        # cards makes the assessment look like the whole field when it is not.
+    def test_a_rejected_model_is_listed_with_what_stopped_it(self):
+        # Leaving it out makes the ranking look like the whole field when it is not.
+        # It joins the models the gates excluded: both are out of the ranking, and
+        # both a reader wants named with the reason.
         self.write("triage.jsonl", [
-            dict(model="slow:1", passed=False, gate="speed",
-                 detail="generates 9 tok/s", seconds=11.0, ts=1.0),
+            dict(model="slow:1", passed=False, findings=[{"code": "slow_generation", "tok_s": 9.0}], ts=1.0),
         ])
         page = self.render(["slow:1"])
-        assessment = page.split(">Assessment", 1)[1].split("Ruled Out Before", 1)[0]
+        assessment = self.assessed(page)
         self.assertIn("slow:1", assessment)
-        self.assertIn("p-unsuitable", assessment)
-        self.assertIn("Rejected at the speed gate", assessment)
+        self.assertIn("9 tok/s", assessment)
+        self.assertNotIn("barcell", assessment, "nothing was measured to draw")
 
-    def test_the_card_does_not_imply_measurements_it_never_took(self):
+    def test_no_figure_is_invented_for_a_model_that_was_stopped(self):
         self.write("triage.jsonl", [
-            dict(model="slow:1", passed=False, gate="speed",
-                 detail="generates 9 tok/s", seconds=11.0, ts=1.0),
+            dict(model="slow:1", passed=False, findings=[{"code": "slow_generation", "tok_s": 9.0}], ts=1.0),
         ])
-        assessment = self.render(["slow:1"]).split(">Assessment", 1)[1] \
-                                            .split("Ruled Out Before", 1)[0]
-        self.assertIn("Nothing beyond this gate was", assessment)
-        for absent in ("Hard set", "Prefill @48k", "Speed score"):
+        # Triage stops at the first decisive finding, so nothing after it was
+        # measured and nothing after it is shown -- not even as a dash, which
+        # reads as a measurement that came back empty.
+        assessment = self.assessed(self.render(["slow:1"]))
+        self.assertNotIn("<dt>", assessment)
+        for absent in ("Prefill", "Speed score"):
             self.assertNotIn(absent, assessment, absent)
 
-    def test_a_field_with_no_rejections_gets_no_section(self):
+    def test_a_model_triaged_again_is_judged_by_the_newer_record(self):
+        # The ledger outlives the rules that wrote it. A model rejected under an
+        # older rule and cleared under the current one is cleared, or the page
+        # both ranks it and reports it as stopped.
         self.write("triage.jsonl", [
-            dict(model="m:1", passed=True, gate="speed", detail="ok",
-                 seconds=1.0, ts=1.0),
+            dict(model="m:1", passed=False, ts=1.0,
+                 findings=[{"code": "needle_missed", "depth": 24576}]),
+            dict(model="m:1", passed=True, ts=2.0, findings=[]),
         ])
-        self.assertNotIn("Ruled Out Before Scoring", self.render(["m:1"]))
+        page = self.render(["m:1"])
+        self.assertNotIn("needle", page, "the older rejection is not the verdict")
+        row = self.row(self.assessed(page), "m:1")
+        self.assertIn("unmeasured", row, "named on the page, so its state is stated")
+        self.assertIn("not screened", row)
+
+    def test_rejections_outside_the_shortlist_are_left_out(self):
+        # The triage ledger outlives a run. A report narrowed to some models must
+        # not describe two fields at once.
+        self.write("triage.jsonl", [
+            dict(model="asked:1", passed=False, findings=[{"code": "slow_generation", "tok_s": 9.0}], ts=1.0),
+            dict(model="other:1", passed=False,
+                 findings=[{"code": "context_truncated", "num_ctx": 32768}], ts=2.0),
+        ])
+        page = self.render(["asked:1"])
+        self.assertIn("asked:1", page)
+        self.assertNotIn("other:1", page)
+
+    def test_the_default_field_includes_models_only_triage_saw(self):
+        # Their measurements were pruned, so the triage ledger is the only place
+        # they survive; a report of "everything stored" has to look there.
+        self.write("triage.jsonl", [
+            dict(model="pruned:1", passed=False, findings=[{"code": "slow_generation", "tok_s": 9.0}], ts=1.0),
+        ])
+        out = self.tmp / "all.html"
+        report.run(Config(results_dir=self.tmp), out, None)
+        self.assertIn("pruned:1", out.read_text(encoding="utf-8"))
+
+    def test_a_model_that_cleared_triage_is_not_called_rejected(self):
+        self.write("triage.jsonl", [
+            dict(model="m:1", passed=True, findings=[], ts=1.0),
+        ])
+        self.assertNotIn('p-unsuitable">unsuitable', self.render(["m:1"]))
 
     def test_it_survives_no_triage_ledger_at_all(self):
-        self.assertNotIn("Ruled Out Before Scoring", self.render([]))
+        self.assertNotIn('p-unsuitable">unsuitable', self.render([]))
+
+class TestNothingReachesThePageUnescaped(ReportCase):
+    """Text on the page is escaped once, and markup built here is not escaped at all.
+
+    A model name comes off the server, so it is not ours to trust; a dash or a bar
+    is markup this module made, and escaping it again would print the tags.
+    """
+
+    def test_a_model_name_carrying_markup_is_escaped(self):
+        name = "<script>alert(1)</script>:8b"
+        self.write_tasks([screen_record(name)])
+        self.write("probe.jsonl", [probe_record(name)])
+        page = self.render([name])
+        self.assertNotIn("<script>", page)
+        self.assertIn("&lt;script&gt;", page)
+
+    def test_markup_this_module_built_is_left_alone(self):
+        from codesift.report import bar, esc, num
+        self.assertEqual(esc(num(None)), "&mdash;", "a dash must not be escaped twice")
+        self.assertIn("<div class=\"bar\">", esc(bar(50, "plain")))
+
+    def test_escaping_is_idempotent(self):
+        from codesift.report import esc
+        once = esc("a & b")
+        self.assertEqual(esc(once), once)
+
+
+class TestThePageSaysWhatItMeasuredAndStops(ReportCase):
+    """The copy states the rule and the figure. It does not argue for either.
+
+    Both of these have gone wrong in edits rather than in design, so they are
+    checked here instead of being remembered.
+    """
+
+    INTERNAL = ("gate", "ledger", "needle", "jsonl", "regrade", "triage")
+
+    def page(self):
+        self.write_tasks([screen_record("m")])
+        self.write("probe.jsonl", [probe_record("m")])
+        return self.render(["m"])
+
+    def ledes(self, page):
+        return re.findall(r'<div class="lede"><p>(.*?)</p>', page, re.S)
+
+    def test_no_internal_vocabulary_reaches_the_reader(self):
+        page = self.page().lower()
+        body = page[page.index('<div class="wrap">'):]
+        for word in self.INTERNAL:
+            with self.subTest(word=word):
+                self.assertNotIn(word, body, f"{word!r} is how the code talks, not the page")
+
+    def test_no_lede_appends_an_aside(self):
+        # A dash in a lede has every time been an interpretation bolted onto a
+        # fact: what a verdict is supposed to mean to the reader, what the figure
+        # is really saying. The fact is the whole job. A flag named in <code> is
+        # not that, so it is taken out before looking.
+        for lede in self.ledes(self.page()):
+            prose = re.sub(r"<code>.*?</code>", "", lede, flags=re.S)
+            with self.subTest(lede=lede[:40]):
+                self.assertNotIn("--", prose)
+                self.assertNotIn("\u2014", prose)
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -261,95 +358,41 @@ class TestToolCallGate(ReportCase):
     """
 
     def field(self, model, *, passed, format_ok):
-        """One tool task per set; only the basic one fails, as the real cases did."""
-        rec = screen_record(model, "basic")
-        rec["tasks"][1].update(passed=passed, format_ok=format_ok)
-        hard = screen_record(model, "hard")
-        self.write("screen.jsonl", [rec, hard,
-                                    screen_record("clean", "basic"),
-                                    screen_record("clean", "hard")])
+        """Two tool tasks; only one of them fails, as the real cases did."""
+        recs = screen_record(model)
+        recs.append(dict(recs[0], task="t_tool2", passed=True, score=1.0,
+                         format_ok=True))
+        recs[0].update(passed=passed, score=float(passed), format_ok=format_ok)
+        self.write_tasks([recs, screen_record("clean")])
         self.write("probe.jsonl", [probe_record(model), probe_record("clean")])
         return self.render([model, "clean"])
 
     def verdict(self, html, model):
         import re
-        m = re.search(r"<h3>" + re.escape(model) + r'</h3><span class="pill p-(\w+)">',
-                      html.split("<h2>Assessment</h2>")[1])
+        m = re.search(r"<th>" + re.escape(model) + r'(?:<span[^>]*>.*?</span>)?</th>\s*'
+                      r'<td><span class="pill p-(\w+)">', self.assessed(html), re.S)
         return m.group(1) if m else None
 
     def test_an_unparseable_call_excludes_the_model(self):
         html = self.field("mute", passed=False, format_ok=False)
         self.assertEqual(self.verdict(html, "mute"), "unsuitable")
-        self.assertIn("malformed or absent", html)
-        ranking = html.split("Full Ranking")[1].split("</table>")[0]
-        self.assertNotIn("mute", ranking)
+        self.assertIn("unparseable", self.assessed(html))
+        self.assertNotIn("mute", self.picks(html), "it must not be recommended")
 
     def test_a_well_formed_call_to_the_wrong_tool_is_graded(self):
         html = self.field("misdirected", passed=False, format_ok=True)
         self.assertEqual(self.verdict(html, "misdirected"), "limited")
-        self.assertIn("calls well-formed", html)
-        ranking = html.split("Full Ranking")[1].split("</table>")[0]
+        self.assertIn("to the wrong tool", html)
+        ranking = html.split("<h2>Ranking</h2>")[1].split("</table>")[0]
         self.assertIn("misdirected", ranking)
 
-    def test_both_task_sets_count_toward_the_tool_figure(self):
-        # One miss out of two tool tasks across both sets is 50%. Counting the basic set
-        # alone, which holds a single tool task here, would report 0% for the same miss.
+    def test_every_tool_task_counts_toward_the_figure(self):
+        # One miss out of two tool tasks. Dropping any of them would let the same
+        # miss read as a much larger share.
         html = self.field("misdirected", passed=False, format_ok=True)
-        self.assertIn("tool choice 50%", html)
+        self.assertIn("50% of tool calls to the wrong tool", html)
 
 
-class TestLatencyVerdict(ReportCase):
-    """Latency is judged in seconds on this machine, not against the other models.
-
-    An earlier version set the bar at a multiple of the fastest model measured, which
-    meant a verdict changed when a quicker model joined the run: two models at 100% on
-    the hard set were relabelled limited purely because something faster appeared
-    beside them.
-    """
-
-    def field(self, *models):
-        """models as (name, prefill, gen) -> screen and probe records."""
-        screen, probe = [], []
-        for name, prefill, gen in models:
-            screen += [screen_record(name, "basic"), screen_record(name, "hard")]
-            probe.append(probe_record(name, prefill=prefill, gen=gen))
-        self.write("screen.jsonl", screen)
-        self.write("probe.jsonl", probe)
-        return [m[0] for m in models]
-
-    def verdict(self, html, model):
-        import re
-        m = re.search(r"<h3>" + re.escape(model) + r'</h3><span class="pill p-(\w+)">',
-                      html.split("<h2>Assessment</h2>")[1])
-        return m.group(1) if m else None
-
-    def test_a_faster_model_joining_does_not_relabel_the_field(self):
-        # 60s prefill and 45 t/s: about 77s per task, comfortably inside the bar.
-        alone = self.render(self.field(("steady", 60.0, 45.0)))
-        self.assertEqual(self.verdict(alone, "steady"), "suitable")
-        with_quick = self.render(self.field(("steady", 60.0, 45.0), ("quick", 5.0, 90.0)))
-        self.assertEqual(self.verdict(with_quick, "steady"), "suitable")
-        self.assertEqual(self.verdict(with_quick, "quick"), "suitable")
-
-    def test_a_slow_model_is_limited_on_its_own_numbers(self):
-        # 130s prefill and 40 t/s: about 149s per task, past the two-minute mark.
-        html = self.render(self.field(("crawler", 130.0, 40.0)))
-        self.assertEqual(self.verdict(html, "crawler"), "limited")
-        self.assertIn("task time", html)
-
-    def test_a_model_too_slow_to_use_is_excluded_before_scoring(self):
-        # The case a dense model spilling out of VRAM produces: prefill collapses and
-        # every token is generated across the bus.
-        html = self.render(self.field(("offloaded", 320.0, 5.0), ("steady", 60.0, 45.0)))
-        self.assertEqual(self.verdict(html, "offloaded"), "unsuitable")
-        self.assertIn("minutes per task", html)
-        ranking = html.split("Full Ranking")[1].split("</table>")[0]
-        self.assertNotIn("offloaded", ranking)
-
-    def test_the_thresholds_are_stated_in_the_report(self):
-        html = self.render(self.field(("steady", 60.0, 45.0)))
-        self.assertIn(f"{report.SLOW_TASK_S:.0f}s", html)
-        self.assertIn(f"{report.UNUSABLE_TASK_S:.0f}s", html)
 
 
 class TestGenerationFloor(ReportCase):
@@ -362,52 +405,305 @@ class TestGenerationFloor(ReportCase):
     """
 
     def render_one(self, **probe):
-        self.write("screen.jsonl", [screen_record("m", "basic"), screen_record("m", "hard")])
+        self.write_tasks([screen_record("m")])
         self.write("probe.jsonl", [probe_record("m", **probe)])
         return self.render(["m"])
 
     def verdict(self, html):
         import re
-        m = re.search(r'<h3>m</h3><span class="pill p-(\w+)">',
-                      html.split("<h2>Assessment</h2>")[1])
+        m = re.search(r'<th>m(?:<span[^>]*>.*?</span>)?</th>\s*'
+                      r'<td><span class="pill p-(\w+)">', self.assessed(html), re.S)
         return m.group(1) if m else None
 
+    def excluded(self, html):
+        """A model with no figures is in the table with dashes and a finding."""
+        return self.assessed(html)
+
     def test_a_model_slower_than_reading_speed_is_excluded(self):
-        html = self.render_one(gen=6.0, moe=False, pct_gpu=36.0)
+        html = self.render_one(gen=6.0, pct_gpu=36.0)
         self.assertEqual(self.verdict(html), "unsuitable")
-        self.assertIn("below 20", html)
-        # Excluded before scoring, so there is no ranking for it to appear in.
-        self.assertIn("No model cleared", html)
-        self.assertNotIn("Full Ranking", html)
+        self.assertIn("too slow to use", self.assessed(html))
+        self.assertIn("No model can be recommended", html)
+        self.assertNotIn("barcell", self.assessed(html), "it has no figures to show")
 
     def test_poor_placement_alone_does_not_condemn_a_model(self):
         # The sharpest case in the measured field: a mixture of experts at a third
         # resident, generating faster than anything else on the card.
-        html = self.render_one(gen=60.1, moe=True, pct_gpu=33.0)
+        html = self.render_one(gen=60.1, pct_gpu=33.0)
         self.assertEqual(self.verdict(html), "suitable")
 
     def test_the_reason_carries_its_own_explanation(self):
-        html = self.render_one(gen=13.0, moe=False, pct_gpu=47.0)
-        self.assertIn("dense and 47% resident", html)
+        html = self.render_one(gen=13.0, pct_gpu=47.0)
+        self.assertIn("too slow to use: 13 tok/s", html)
 
     def test_an_older_record_without_architecture_still_reports_the_rate(self):
         rec = probe_record("m", gen=6.0)
-        del rec["moe"]
-        self.write("screen.jsonl", [screen_record("m", "basic"), screen_record("m", "hard")])
+        self.write_tasks([screen_record("m")])
         self.write("probe.jsonl", [rec])
         html = self.render(["m"])
-        self.assertEqual(self.verdict(html), "unsuitable")
-        self.assertIn("40% resident", html)
-        self.assertNotIn("dense and", html)
+        self.assertIn("too slow to use: 6 tok/s", self.excluded(html))
+        # Where the model sat is the Speed table's column, not the finding's job.
+        self.assertIn("40", html.split("<h2>Speed</h2>")[1])
+        self.assertNotIn("dense", html)
 
 
-class TestQuantisationColumn(ReportCase):
-    def test_missing_quantisation_renders_as_a_dash(self):
-        # The server is unreachable here, so no quantisation can be resolved and
-        # every row falls back to the placeholder.
-        self.write("screen.jsonl", [screen_record("solo", "basic"),
-                                    screen_record("solo", "hard")])
-        self.write("probe.jsonl", [probe_record("solo")])
+class TestTheReportNamesTheWindowThatWasUsed(ReportCase):
+    """A card must not cite numbers the run did not use.
+
+    Both strings were literals reading `64k` and `48k`. Anyone screening at a
+    smaller window got a verdict describing a measurement nobody took, and the
+    figure they were being judged on appeared nowhere on the page.
+    """
+
+    def field(self, ctx, **probe_kwargs):
+        self.cfg = Config(host=OFFLINE, results_dir=self.tmp, ctx=ctx)
+        self.write_tasks([screen_record("m", ctx=ctx),
+                                    screen_record("m", ctx=ctx)])
+        self.write("probe.jsonl", [probe_record("m", ctx=ctx, **probe_kwargs)])
+        return analysis.analyse(self.cfg, ["m"])
+
+    def why(self, ctx, **probe_kwargs):
+        return sentence({"findings": self.field(ctx, **probe_kwargs).verdict("m")[1]})
+
+    def test_truncation_names_the_window_at_32k(self):
+        self.assertIn("32k window", self.why(32768, truncated=True))
+
+    def test_truncation_names_the_window_at_64k(self):
+        self.assertIn("64k window", self.why(65536, truncated=True))
+
+    def test_a_truncated_prompt_names_the_window_it_was_cut_at(self):
+        self.assertIn("32k window", self.why(32768, truncated=True))
+        self.assertIn("64k window", self.why(65536, truncated=True))
+
+    def test_a_32k_run_never_mentions_the_default_window(self):
+        self.field(32768)
+        html = self.render(["m"])
+        self.assertIn("32,768", html)
+        self.assertIn("24,576", html)
+        self.assertNotIn("65,536", html)
+        self.assertNotIn("48,000", html)
+
+    def test_the_window_is_stated_once(self):
+        # It was in the opening sentence and again in the header strip below it.
+        self.field(32768)
+        html = self.render(["m"])
+        self.assertEqual(html.count("32,768"), 1)
+
+    def test_records_from_two_windows_name_both(self):
+        # Not a defect: measurements taken at different windows are not
+        # interchangeable, and hiding one of them would present them as if
+        # they were.
+        self.cfg = Config(host=OFFLINE, results_dir=self.tmp, ctx=32768)
+        self.write_tasks([screen_record("m", ctx=32768),
+                                    screen_record("m", ctx=32768),
+                                    screen_record("n", ctx=65536),
+                                    screen_record("n", ctx=65536)])
+        self.write("probe.jsonl", [probe_record("m", ctx=32768), probe_record("n", ctx=65536)])
+        html = self.render(["m", "n"])
+        self.assertIn("32,768", html)
+        self.assertIn("65,536", html)
+
+
+class TestRejectionTextIsRebuiltNotReplayed(ReportCase):
+    """A rejection is stored as fields, and phrased when the page is built.
+
+    Wording frozen into the ledger at measurement time could only be changed by
+    measuring the model again.
+    """
+
+    def rejection(self, rec):
+        self.write("triage.jsonl", [dict(model="dud", passed=False, **rec)])
+        row = self.render(["dud"])
+        row = row[row.index("<th>dud</th>"):]
+        return re.search(r'<td class="detail">(.*?)</td>', row, re.S).group(1)
+
+    def test_the_sentence_comes_from_the_fields(self):
+        text = self.rejection(dict(findings=[{"code": "context_truncated",
+                                              "num_ctx": 32768}]))
+        self.assertIn("32k window", text)
+
+    def test_every_finding_emitted_anywhere_has_a_sentence(self):
+        # Both the gates and the records report through findings, so both are
+        # read here: a code with no sentence renders as its own name on the page.
+        from codesift import findings
+        emitted = set()
+        for module in ("triage", "analysis"):
+            emitted |= set(re.findall(r'"code": "(\w+)"',
+                                      Path(f"src/codesift/{module}.py").read_text()))
+        self.assertTrue(emitted, "no findings found in the gates")
+        for code in emitted:
+            with self.subTest(code=code):
+                said = findings.describe({"code": code, "tok_s": 1.0, "wrong": 1,
+                                          "malformed": 1, "total": 2, "num_ctx": 32768,
+                                          "depth": 24576, "count": 1, "message": "x"})
+                self.assertNotEqual(said, code, "renders as its own code, not a sentence")
+
+    def test_a_gate_and_the_records_word_the_same_fault_the_same_way(self):
+        # The one thing two paths must never do is disagree on one page: the
+        # ranking row is phrased from the records, the excluded row from the gate.
+        from codesift import findings
+        for finding in ({"code": "context_truncated", "num_ctx": 32768},
+                        {"code": "slow_generation", "tok_s": 9.0}):
+            with self.subTest(code=finding["code"]):
+                self.assertEqual(findings.describe(finding),
+                                 findings.sentence({"findings": [finding]}))
+
+
+class TestHeadingsAndBars(ReportCase):
+    """Section headings are title case, and a measurement is not colour-graded.
+
+    The pass-rate bar and the stripe down the left of its row were coloured by
+    thresholds at 90 and 75 -- the same bands that were taken out of the verdicts
+    for turning a measurement into a cliff. Colouring them amber said the report
+    judged the figure after all.
+    """
+
+    SMALL = {"a", "an", "and", "at", "by", "for", "in", "of", "on", "or", "the", "to"}
+
+    def page(self):
+        self.write_tasks([screen_record("m", rate=83.0),
+                                    screen_record("m", rate=76.0)])
+        self.write("probe.jsonl", [probe_record("m")])
+        return self.render(["m"])
+
+    def test_every_section_heading_is_title_case(self):
+        for head in re.findall(r"<h2>([^<]+)</h2>", self.page()):
+            for i, word in enumerate(head.split()):
+                if i and word.lower() in self.SMALL:
+                    continue
+                with self.subTest(heading=head, word=word):
+                    self.assertTrue(word[0].isupper(), f"{head!r} is not title case")
+
+    def test_the_pass_rate_bar_is_not_graded_by_colour(self):
+        page = self.page()
+        table = page[page.index("<h2>Pass Rate</h2>"):]
+        table = table[:table.index("</section>")]
+        for cls in ("s-good", "s-warn", "s-bad"):
+            self.assertNotIn(cls, table, "the bar is coloured by a hidden threshold")
+
+    def test_the_pass_rate_row_carries_no_severity_stripe(self):
+        page = self.page()
+        table = page[page.index("<h2>Pass Rate</h2>"):]
+        table = table[:table.index("</section>")]
+        for cls in ('r-good', 'r-warn', 'r-bad'):
+            self.assertNotIn(cls, table, "the row handle is coloured by a hidden threshold")
+
+
+class TestBarCellsStayTableCells(ReportCase):
+    """A bar cell must remain a table cell, whatever sits beside it.
+
+    `display:flex` on a <td> takes it out of table layout, and two such cells side
+    by side are wrapped into one anonymous cell, which stacks the speed bar under
+    the quality bar instead of beside it.
+    """
+
+    def page(self):
+        self.write_tasks([screen_record("m")])
+        self.write("probe.jsonl", [probe_record("m")])
+        return self.render(["m"])
+
+    def test_the_cell_is_never_the_flex_container(self):
+        html = self.page()
+        for rule in re.findall(r"\.barcell[^{]*\{([^}]*)\}", html):
+            self.assertNotIn("display:flex", rule.replace(" ", ""))
+
+    def test_every_bar_cell_holds_a_flex_wrapper(self):
+        for cell in re.findall(r'<td class="barcell">(.*?)</td>', self.page()):
+            self.assertTrue(cell.startswith('<div class="barwrap">'), cell[:60])
+
+    def test_the_ranking_puts_the_two_bars_in_separate_cells(self):
+        row = re.search(r'<tbody>(<tr.*?</tr>)', self.page(), re.S).group(1)
+        self.assertEqual(row.count('class="barcell"'), 2)
+
+    def test_nothing_of_varying_width_sits_beside_a_bar(self):
+        # Anything beside the bar that is present on some rows and absent on others
+        # takes its width out of the bar, so no two bars in the column match.
+        for cell in re.findall(r'<td class="barcell">(.*?)</td>', self.page()):
+            self.assertNotIn('class="spread"', cell)
+
+
+class TestTheHeader(ReportCase):
+    """It names the tool and the server, and nothing measured from this machine."""
+
+    def eyebrow(self, *probes):
+        self.write_tasks([screen_record("m")])
+        self.write("probe.jsonl", list(probes))
+        html = self.render(["m"])
+        return re.search(r'<p class="eyebrow">(.*?)</p>', html, re.S).group(1)
+
+    def test_it_names_the_tool_and_the_server(self):
+        self.assertEqual(self.eyebrow(probe_record("m")).strip(), "codesift \u00b7 Ollama")
+
+    def test_it_states_no_memory_figure(self):
+        # The GPU total was read off the local machine, which is the wrong one when
+        # the server is elsewhere; the figure that replaced it was Ollama's placement,
+        # which said more about the largest model measured than about the page.
+        self.assertNotIn("GB", self.eyebrow(probe_record("m")))
+
+    def test_a_remote_host_is_named(self):
+        self.cfg = Config(host="http://box.lan:11434", results_dir=self.tmp)
+        self.assertIn("box.lan", self.eyebrow(probe_record("m")))
+
+
+class TestWhatMustBeResident(ReportCase):
+    """Memory is reported as the one figure the server actually gives.
+
+    It was briefly split into weights and cache, with the weights taken from the
+    size on disk. That is not the loaded weight size: one 9B model is 6.59GB on
+    disk and loads about 5.3GB, and an E4B sub-model ships 9.61GB to load 3.26GB.
+    The subtraction produced a cache of zero and a total smaller than its own
+    stated weights.
+    """
+
+    def row(self, **probe_kwargs):
+        self.write_tasks([screen_record("m")])
+        self.write("probe.jsonl", [probe_record("m", **probe_kwargs)])
+        return self.render(["m"])
+
+    def test_the_total_is_what_is_shown(self):
+        html = self.row(weights=5.35, cache=11.31)
+        self.assertIn("16.7", html)          # the figure that decides whether it fits
+
+    def test_no_figure_is_derived_from_the_size_on_disk(self):
+        # 3.26 loaded against 9.61 on disk: any subtraction here is fiction.
+        html = self.row(weights=9.61, cache=-6.35)
+        self.assertNotIn("9.6", html)
+
+    def test_the_column_names_memory_rather_than_an_internal(self):
+        html = self.row()
+        self.assertIn('Memory <span class="unit">GB</span>', html)
+        self.assertNotIn("Weights + context", html)
+
+    def test_a_record_without_the_split_falls_back_to_the_total(self):
+        # Records written before the cache was measured carry only a total, and
+        # must still render rather than showing a blank column.
+        self.write_tasks([screen_record("m")])
+        rec = probe_record("m")
+        rec["placement"] = {"pct_gpu": 40.0, "total_gb": 16.7}
+        self.write("probe.jsonl", [rec])
+        self.assertIn("16.7", self.render(["m"]))
+
+    def test_no_placement_at_all_renders_a_dash(self):
+        self.write_tasks([screen_record("m")])
+        rec = probe_record("m")
+        rec["placement"] = {}
+        self.write("probe.jsonl", [rec])
+        self.assertIn("&mdash;", self.render(["m"]))
+
+
+class TestMissingFigures(ReportCase):
+    """A figure that was never measured shows a dash, and the dash is a dash.
+
+    Escaping the placeholder a second time put the literal text `&mdash;` in the
+    table, which reads as a broken template rather than as an absent measurement.
+    """
+
+    def test_an_absent_figure_renders_as_an_unescaped_dash(self):
+        # Nothing placed the model, so the memory column has no figure to print.
+        self.write_tasks([screen_record("solo")])
+        rec = probe_record("solo")
+        rec["placement"] = {}
+        self.write("probe.jsonl", [rec])
         html = self.render(["solo"])
         self.assertNotIn("&amp;mdash;", html)
         self.assertIn('<td class="figure">&mdash;</td>', html)
@@ -418,51 +714,27 @@ class TestSpeedScore(ReportCase):
 
     def test_slowest_model_is_not_scored_zero(self):
         recs, probes = [], []
-        for name, prefill in (("quick", 40.0), ("slow", 80.0)):
-            recs += [screen_record(name, "basic"), screen_record(name, "hard")]
+        for name, prefill in (("quick", 40.0), ("slow", 70.0)):
+            recs.append(screen_record(name))
             probes.append(probe_record(name, prefill=prefill, gen=100.0))
-        self.write("screen.jsonl", recs)
+        self.write_tasks(recs)
         self.write("probe.jsonl", probes)
         html = self.render(["quick", "slow"])
-        table = html.split("Full Ranking")[1].split("</table>")[0]
+        table = html.split("<h2>Ranking</h2>")[1].split("</table>")[0]
+        # Found by header rather than by position, so inserting a column does not
+        # silently make this assert about a different number.
+        head = [re.sub(r"<[^>]+>", "", h).strip()
+                for h in re.findall(r"<th[^>]*>(.*?)</th>", table.split("</thead>")[0], re.S)]
+        col = next(i for i, h in enumerate(head) if h.startswith("Speed"))
         rows = re.findall(r"<tr class=\"r-\w+\">.*?</tr>", table, re.S)
         cells = [[re.sub(r"<[^>]+>", "", c).strip()
                   for c in re.findall(r"<t[hd][^>]*>(.*?)</t[hd]>", r, re.S)] for r in rows]
-        speeds = {c[1]: float(c[4]) for c in cells if len(c) > 4}
+        speeds = {c[1]: float(re.sub(r"[^\d.]", "", c[col]) or 0) for c in cells if len(c) > col}
         self.assertEqual(speeds["quick"], 100.0)
-        # 47.7s against 87.7s modelled: slower, but far from a zero score.
+        # 40s against 70s to read the context, generating at the same rate: slower,
+        # but far from a zero score.
         self.assertGreater(speeds["slow"], 50.0)
-        self.assertLess(speeds["slow"], 60.0)
-
-
-class TestUnknownArchitecture(ReportCase):
-    """Absence of evidence is not evidence of density.
-
-    A probe record predating the architecture field, or one whose model was gone
-    from the server when it was written, carries no `moe` key. Rendering that as
-    "dense" would attach the wrong cause to a slow result — and to a fast one it
-    would misdescribe the model outright.
-    """
-
-    def why(self, html):
-        """The card's reason text, not the section's explanatory prose."""
-        import re
-        return re.search(r'<p class="why">(.*?)</p>', html, re.S).group(1)
-
-    def test_a_record_without_the_field_is_not_called_dense(self):
-        rec = probe_record("m", gen=6.0)
-        del rec["moe"]
-        self.write("screen.jsonl", [screen_record("m", "basic"), screen_record("m", "hard")])
-        self.write("probe.jsonl", [rec])
-        why = self.why(self.render(["m"]))
-        self.assertIn("generates 6 tok/s", why)
-        self.assertIn("40% resident", why)
-        self.assertNotIn("dense", why)
-
-    def test_an_explicit_false_is_reported_as_dense(self):
-        self.write("screen.jsonl", [screen_record("m", "basic"), screen_record("m", "hard")])
-        self.write("probe.jsonl", [probe_record("m", gen=6.0, moe=False)])
-        self.assertIn("dense and", self.why(self.render(["m"])))
+        self.assertLess(speeds["slow"], 90.0)
 
 
 class TestTruncatedReplies(ReportCase):
@@ -474,530 +746,216 @@ class TestTruncatedReplies(ReportCase):
     letting the number stand unqualified.
     """
 
-    def render_with(self, capped):
-        basic = screen_record("m", "basic")
-        basic["hit_cap_n"] = capped
-        self.write("screen.jsonl", [basic, screen_record("m", "hard")])
+    def render_with(self, capped=0, silent=0):
+        self.write_tasks([screen_record("m", capped=capped, silent=silent)])
         self.write("probe.jsonl", [probe_record("m")])
         import re
-        assessment = self.render(["m"]).split("<h2>Assessment</h2>")[1]
-        return re.search(r'<p class="why">(.*?)</p>', assessment, re.S).group(1)
+        assessment = self.assessed(self.render(["m"]))
+        found = re.findall(r'<td class="detail">(.*?)</td>', assessment, re.S)
+        return " ".join(found)
 
-    def test_truncation_is_reported_on_the_card(self):
-        self.assertIn("2 replies cut at the output budget", self.render_with(2))
+    def test_truncation_is_reported_beside_the_model(self):
+        self.assertIn("17% of replies cut off at the output limit", self.render_with(2))
 
     def test_a_single_truncation_reads_correctly(self):
-        self.assertIn("1 reply cut at the output budget", self.render_with(1))
+        self.assertIn("8% of replies cut off at the output limit", self.render_with(1))
 
     def test_a_clean_run_says_nothing_about_the_budget(self):
-        self.assertNotIn("output budget", self.render_with(0))
+        self.assertNotIn("output limit", self.render_with(0))
+
+    def test_a_reply_that_never_started_is_not_called_cut_off(self):
+        # One model reached the budget on five tasks having written nothing at all,
+        # and three did the same at nearly three times the budget. Calling that cut
+        # off points at the budget, which is the wrong thing to change.
+        said = self.render_with(silent=2)
+        self.assertIn("produced no answer within the output limit", said)
+        self.assertNotIn("cut off", said)
 
 
 class TestQualityFloor(ReportCase):
     """A fast model that does not do the work must not lead the ranking.
 
-    This is the failure the floor exists to prevent: an 8B model that fails most
-    of its tasks returns in a fraction of the time precisely because it is not
-    doing them, and unconditional latency credit put it at rank 1 above a model
-    scoring 100%.
+    An 8B model that fails most of its tasks returns in a fraction of the time
+    precisely because it is not doing them, and unconditional latency credit put
+    it at rank 1 above a model scoring 100%. A relative quality floor used to
+    prevent that; the verdict ordering does it now, and decides the reference time
+    for the speed figure as well.
     """
 
     def field(self):
         # "quick" is twelve times faster and answers under half its tasks; "solid"
         # gets everything right and takes its time over it.
-        self.write("screen.jsonl", [
-            screen_record("solid", "basic", rate=100.0),
-            screen_record("solid", "hard", rate=100.0),
-            screen_record("quick", "basic", rate=57.1),
-            screen_record("quick", "hard", rate=46.7),
+        self.write_tasks([
+            screen_record("solid", rate=100.0),
+            screen_record("solid", rate=100.0),
+            screen_record("quick", rate=57.1),
+            screen_record("quick", rate=46.7),
         ])
-        self.write("probe.jsonl", [probe_record("solid", gen=47.0),
-                                   probe_record("quick", gen=279.0)])
-        return report.analyse(self.cfg, ["solid", "quick"])
+        self.write("probe.jsonl", [probe_record("solid", prefill=80.0, gen=47.0),
+                                   probe_record("quick", prefill=20.0, gen=279.0)])
+        return analysis.analyse(self.cfg, ["solid", "quick"])
+
+    def test_one_table_covers_every_task(self):
+        # Two tables with the same columns and the same text gave a reader nothing
+        # to say which to believe.
+        A = self.field()
+        html = report.build(self.cfg, A.models)
+        self.assertEqual(html.count("<h2>Pass Rate</h2>"), 1)
+        for gone in ("Task Set A", "Task Set B", "Hard Set", "Basic Set"):
+            self.assertNotIn(gone, html, gone)
 
     def test_the_low_quality_model_is_ranked_below(self):
         A = self.field()
         self.assertEqual(A.sc_rank[0], "solid")
-        self.assertLess(A.sc["quick"]["composite"], A.sc["solid"]["composite"])
+        self.assertLess(A.sc_rank.index("solid"), A.sc_rank.index("quick"))
 
-    def test_quality_outweighs_speed(self):
-        self.assertAlmostEqual(report.W_QUALITY + report.W_SPEED, 1.0)
-        self.assertGreater(report.W_QUALITY, report.W_SPEED,
-                           "a slow model that writes working code is still usable; "
-                           "a fast one that does not is not")
-
-    def test_speed_earns_nothing_below_the_floor(self):
+    def test_no_single_score_combines_quality_and_speed(self):
+        # A weighted score decided the trade on the reader's behalf, and could not
+        # be compared across verdicts, so the number and the position disagreed.
         A = self.field()
-        self.assertFalse(A.sc["quick"]["above_floor"])
-        self.assertEqual(A.sc["quick"]["composite"], round(report.W_QUALITY * 46.7, 1),
-                         "below the floor the composite is quality alone")
-        self.assertGreater(A.sc["quick"]["speed"], 100.0,
-                           "a below-floor model faster than every usable one still "
-                           "reports the speed it earns nothing for")
+        self.assertNotIn("composite", A.sc["solid"])
+        self.assertFalse(hasattr(report, "W_QUALITY"))
 
-    def test_speed_still_separates_models_above_the_floor(self):
-        self.write("screen.jsonl", [
-            screen_record("slow", "basic", rate=90.0), screen_record("slow", "hard", rate=90.0),
-            screen_record("fast", "basic", rate=90.0), screen_record("fast", "hard", rate=90.0),
-        ])
-        self.write("probe.jsonl", [probe_record("slow", gen=20.0),
-                                   probe_record("fast", gen=80.0)])
-        A = report.analyse(self.cfg, ["slow", "fast"])
-        self.assertTrue(all(A.sc[m]["above_floor"] for m in ("slow", "fast")))
-        self.assertEqual(A.sc_rank[0], "fast")
-
-    def test_no_below_floor_model_outranks_an_above_floor_one(self):
+    def test_the_ranking_never_contradicts_the_verdict(self):
+        # A composite alone put an unsuitable model above four suitable ones, and
+        # 80% quality above 100% because the slower model took three times as long.
         A = self.field()
-        over = [m for m in A.sc_rank if A.sc[m]["above_floor"]]
-        under = [m for m in A.sc_rank if not A.sc[m]["above_floor"]]
-        self.assertTrue(over and under, "the field must contain both to be a test")
-        self.assertLess(max(A.sc_rank.index(m) for m in over),
-                        min(A.sc_rank.index(m) for m in under))
+        order = {"suitable": 0, "limited": 1, "unsuitable": 2}
+        seen = [order[A.verdict(m)[0]] for m in A.sc_rank]
+        self.assertEqual(seen, sorted(seen),
+                         "a worse verdict was ranked above a better one")
 
-    def test_the_rendered_ranking_leads_with_a_qualifying_model(self):
-        self.field()
-        html = self.render(["solid", "quick"])
-        rows = re.findall(r'<tr class="r-\w+">\s*<td[^>]*>\d+</td>\s*<th>(.*?)</th>',
-                          html, re.S)
-        self.assertTrue(rows, "the ranking table did not render")
-        self.assertIn("solid", rows[0])
-        self.assertNotIn("below floor", rows[0])
+    def test_the_speed_figure_is_a_share_of_the_quickest_measured(self):
+        # Nothing exceeds 100%: the quickest model measured is the reference,
+        # whatever its verdict.
+        A = self.field()
+        html = report.build(self.cfg, A.models)
+        table = html[html.index("<h2>Ranking</h2>"):]
+        row = table[table.index("<th>quick</th>"):]
+        row = row[:row.index("</tr>")]
+        # The second bar in the row is the speed score; the first is quality.
+        speed_cell = row.split('class="barcell"')[2]
+        head = html[html.index("<h2>Ranking</h2>"):]
+        head = head[:head.index("</thead>")]
+        self.assertIn('Speed <span class="unit">%</span>', head,
+                      "a share of the fastest measured model, so the column is a percentage")
+        self.assertRegex(speed_cell, r'class="figure">\d+</span>',
+                         "the unit belongs to the header, not to every cell")
 
+    def test_the_ranking_bars_are_not_coloured_by_verdict(self):
+        # A 93% quality bar tinted amber reads as a judgement on the figure. The
+        # verdict has its own pill and its own row stripe.
+        A = self.field()
+        html = report.build(self.cfg, A.models)
+        table = html[html.index("<h2>Ranking</h2>"):]
+        body = table[table.index("<tbody>"):table.index("</tbody>")]
+        for cell in body.split('class="barcell"')[1:]:
+            fill = cell[:cell.index("</div>")]
+            self.assertIn("s-plain", fill)
+            for sev in ("s-good", "s-warn", "s-bad"):
+                self.assertNotIn(sev, fill)
 
-class TestUnmeasuredOnTheHardSet(ReportCase):
-    """A model missing a record is unmeasured, not good.
+    def test_the_ranking_is_coloured_by_verdict(self):
+        # It encoded rank position and floor status, so a limited model showed red
+        # while an unsuitable one showed amber.
+        A = self.field()
+        html = report.build(self.cfg, A.models)
+        table = html[html.index("<h2>Ranking</h2>"):]
+        sev = {"suitable": "good", "limited": "warn", "unsuitable": "bad"}
+        for m in A.sc_rank:
+            row = table[table.index(f"<th>{m}"):]
+            row = table[:table.index(f"<th>{m}")].rsplit("<tr", 1)[1]
+            self.assertIn(f'r-{sev[A.verdict(m)[0]]}"', row, m)
 
-    Every gate is written as "if the measurement says so", so a missing record
-    clears all of them at once. A model with one basic run and no hard run was
-    labelled suitable on the strength of a measurement never taken, and a model
-    that was screened but never probed cleared the truncation, retrieval,
-    generation-rate and task-time gates the same way.
-    """
-
-    def only_basic(self):
-        self.write("screen.jsonl", [screen_record("partial", "basic", rate=64.3)])
-        self.write("probe.jsonl", [probe_record("partial")])
-        return report.analyse(self.cfg, ["partial"])
-
-    def test_it_is_not_called_suitable(self):
-        sev, why = self.only_basic().verdict("partial")
-        self.assertNotEqual(sev, "suitable")
-        self.assertIn("no hard-set result", why)
-
-    def test_it_is_set_aside_before_scoring(self):
-        A = self.only_basic()
-        self.assertIn("no hard-set result", A.eligible("partial"))
-        self.assertNotIn("partial", A.sc_rank)
-
-    def test_a_model_that_was_never_probed_is_not_suitable_either(self):
-        self.write("screen.jsonl", [screen_record("noprobe", "basic", rate=100.0),
-                                    screen_record("noprobe", "hard", rate=100.0)])
-        self.write("probe.jsonl", [])
-        A = report.analyse(self.cfg, ["noprobe"])
-        sev, why = A.verdict("noprobe")
-        self.assertNotEqual(sev, "suitable")
-        self.assertIn("no probe result", why)
-        self.assertIn("no probe result", A.eligible("noprobe"))
-        self.assertNotIn("noprobe", A.sc_rank)
-
-    def test_a_null_taskset_still_reads_as_a_basic_result(self):
-        # Records written before the sets were named carry no taskset at all; one
-        # written with an explicit null must not vanish into a third bucket.
-        rec = screen_record("legacy", "basic", rate=80.0)
-        rec["taskset"] = None
-        self.write("screen.jsonl", [rec])
-        A = report.analyse(self.cfg, ["legacy"])
-        self.assertIn("legacy", A.t1)
-        self.assertEqual(A.t1["legacy"]["rate"], 80.0)
-
-    def test_a_measured_model_is_unaffected(self):
-        self.write("screen.jsonl", [screen_record("full", "basic", rate=100.0),
-                                    screen_record("full", "hard", rate=100.0)])
-        self.write("probe.jsonl", [probe_record("full")])
-        A = report.analyse(self.cfg, ["full"])
-        self.assertEqual(A.verdict("full")[0], "suitable")
-        self.assertEqual(A.eligible("full"), [])
-
-
-class TestSpeedDenominator(ReportCase):
-    """The fastest time is taken from models that pass, not models that give up."""
+    def test_speed_does_not_depend_on_anyone_else_s_verdict(self):
+        # How fast a model is is a property of that model. Taking the reference from
+        # the suitable models made a quicker one read as over 100%, and would have
+        # moved every figure when another model's quality verdict changed.
+        A = self.field()
+        self.assertEqual(A.sc["quick"]["speed"], 100.0,
+                         "the quickest measured model sets the reference")
+        self.assertLessEqual(A.sc["solid"]["speed"], 100.0)
+        self.assertEqual(A.verdict("quick")[0], "suitable",
+                         "a low score is not a disqualification")
 
     def test_a_failing_sprinter_does_not_compress_the_field(self):
-        self.write("screen.jsonl", [
-            screen_record("good", "basic", rate=100.0), screen_record("good", "hard", rate=100.0),
-            screen_record("mid", "basic", rate=90.0), screen_record("mid", "hard", rate=90.0),
-            screen_record("bail", "basic", rate=47.0), screen_record("bail", "hard", rate=47.0),
+        self.write_tasks([
+            screen_record("good", rate=100.0), screen_record("good", rate=100.0),
+            screen_record("mid", rate=90.0), screen_record("mid", rate=90.0),
+            screen_record("bail", rate=47.0, tools_ok=False),
+            screen_record("bail", rate=47.0, tools_ok=False),
         ])
         self.write("probe.jsonl", [probe_record("good", gen=45.0), probe_record("mid", gen=90.0),
                                    probe_record("bail", gen=600.0)])
-        A = report.analyse(self.cfg, ["good", "mid", "bail"])
+        A = analysis.analyse(self.cfg, ["good", "mid", "bail"])
         self.assertEqual(A.sc["mid"]["speed"], 100.0,
-                         "the fastest model above the floor sets the reference")
+                         "the fastest suitable model sets the reference")
         self.assertGreater(A.sc["good"]["speed"], 20.0,
                            "a real contender is not compressed into single digits by a "
                            "model that is quick because it fails")
 
-    def test_removing_a_below_floor_model_leaves_the_others_untouched(self):
-        # Pruning failures must not silently restate everyone else's numbers.
-        records = [
-            screen_record("good", "basic", rate=100.0), screen_record("good", "hard", rate=100.0),
-            screen_record("mid", "basic", rate=90.0), screen_record("mid", "hard", rate=90.0),
-        ]
-        probes = [probe_record("good", gen=45.0), probe_record("mid", gen=90.0)]
-        self.write("screen.jsonl", records + [screen_record("bail", "basic", rate=47.0),
-                                              screen_record("bail", "hard", rate=47.0)])
-        self.write("probe.jsonl", probes + [probe_record("bail", gen=600.0)])
-        before = report.analyse(self.cfg, ["good", "mid", "bail"]).sc
-
-        self.write("screen.jsonl", records)
-        self.write("probe.jsonl", probes)
-        after = report.analyse(self.cfg, ["good", "mid"]).sc
-        for m in ("good", "mid"):
-            self.assertEqual(before[m]["composite"], after[m]["composite"], m)
-
-
-class TestVerdictNeverImproves(ReportCase):
-    """No check may raise a verdict that an earlier check lowered.
-
-    The gates are applied in sequence over one severity variable, so a later
-    assignment can undo an earlier disqualification. A missing record in
-    particular must never rehabilitate a model that a record it does have
-    already ruled out.
-    """
+    def test_quality_does_not_move_when_the_field_changes(self):
+        # Speed is relative and moves with the field by construction; quality is
+        # absolute and must not.
+        A = self.field()
+        before = A.sc["solid"]["quality"]
+        B = analysis.analyse(self.cfg, ["solid"])
+        self.assertEqual(B.sc["solid"]["quality"], before)
 
     def test_a_gap_does_not_rescue_a_disqualified_model(self):
-        broken = screen_record("broken", "basic", rate=100.0)
-        broken["tasks"][1]["format_ok"] = False       # a tool call the harness cannot parse
-        broken["tasks"][1]["passed"] = False
-        self.write("screen.jsonl", [broken])          # and no hard set, and no probe
-        A = report.analyse(self.cfg, ["broken"])
+        broken = screen_record("broken", rate=100.0)
+        broken[0].update(format_ok=False, passed=False, score=0.0)  # unparseable call
+        self.write_tasks([broken])          # and no probe
+        A = analysis.analyse(self.cfg, ["broken"])
         sev, why = A.verdict("broken")
         self.assertEqual(sev, "unsuitable")
-        self.assertTrue(any("malformed" in w for w in why))
-        self.assertIn("no hard-set result", why)
+        self.assertEqual([f["code"] for f in why],
+                         ["malformed_tool_calls", "not_probed"])
 
 
-class TestPartialDataIsNeverSuitable(ReportCase):
-    """Every combination of missing records, rather than the ones already hit twice.
 
-    Both bugs found in this area were the same shape: a gate phrased as "if the
-    measurement says so" passing because there was no measurement. This asserts
-    the property over the whole space instead of one case at a time.
+
+
+
+class TestEveryModelIsAccountedFor(ReportCase):
+    """A model that was measured appears somewhere, with its figures or its reason.
+
+    A model that cleared the gates is in the ranking with its finding beside it;
+    one that did not is in the table naming what excluded it.
     """
-
-    COMBINATIONS = [(basic, hard, probe)
-                    for basic in (True, False)
-                    for hard in (True, False)
-                    for probe in (True, False)]
-
-    def test_only_a_fully_measured_model_can_be_suitable(self):
-        for has_basic, has_hard, has_probe in self.COMBINATIONS:
-            with self.subTest(basic=has_basic, hard=has_hard, probe=has_probe):
-                screen = []
-                if has_basic:
-                    screen.append(screen_record("m", "basic", rate=100.0))
-                if has_hard:
-                    screen.append(screen_record("m", "hard", rate=100.0))
-                self.write("screen.jsonl", screen)
-                self.write("probe.jsonl", [probe_record("m")] if has_probe else [])
-                A = report.analyse(self.cfg, ["m"])
-                complete = has_hard and has_probe
-                sev = A.verdict("m")[0]
-                if complete:
-                    self.assertEqual(sev, "suitable")
-                    self.assertEqual(A.eligible("m"), [])
-                    self.assertIn("m", A.sc_rank)
-                else:
-                    self.assertNotEqual(sev, "suitable",
-                                        "a perfect score on records that exist is not a "
-                                        "verdict on records that do not")
-                    self.assertTrue(A.eligible("m"))
-                    self.assertNotIn("m", A.sc_rank)
-
-
-def agent_record(model, task="ag_module", passed=True, score=None):
-    return dict(model=model, task=task, passed=passed, score=score, detail="",
-                wall_s=300.0, timed_out=False, returncode=0, tool_calls=10,
-                tools=[], turns=8, errors=[], tokens={}, peak_input_tokens=0)
-
-
-class TestAgentResultsInTheVerdict(ReportCase):
-    """Finishing work unattended is a different question from answering a prompt.
-
-    The agent stage runs on a subset of the field, so its results can only lower a
-    verdict. Rewarding them would rank a model above another for the accident of
-    having been measured, which is the shape of two bugs already found here.
-    """
-
-    def field(self, agentic):
-        self.write("screen.jsonl", [screen_record("m", "basic", rate=100.0),
-                                    screen_record("m", "hard", rate=100.0)])
-        self.write("probe.jsonl", [probe_record("m")])
-        self.write("agentic.jsonl", agentic)
-        return report.analyse(self.cfg, ["m"])
-
-    def test_no_agent_data_leaves_the_verdict_alone(self):
-        self.assertEqual(self.field([]).verdict("m")[0], "suitable")
-
-    def test_completing_every_task_does_not_promote(self):
-        A = self.field([agent_record("m", passed=True, score=100.0)])
-        sev, why = A.verdict("m")
-        self.assertEqual(sev, "suitable")
-        self.assertEqual(why, [], "a clean sweep needs no remark")
-
-    def test_one_failure_is_reported_but_does_not_lower_the_verdict(self):
-        # This stage is variable: the same model answered one task by writing
-        # nothing in two turns, then by making four edits in ten, then by writing
-        # nothing again. The screen would not report a rate from a single run, and
-        # neither should a stage with more spread than the screen.
-        A = self.field([dict(agent_record("m", task="ag_feature", passed=False), ts=1.0)])
-        sev, why = A.verdict("m")
-        self.assertEqual(sev, "suitable")
-        self.assertTrue(any("once, not retried" in w for w in why),
-                        "the reader is still told it happened")
-
-    def test_a_failure_that_survives_a_retry_does_lower_it(self):
-        A = self.field([dict(agent_record("m", task="ag_feature", passed=False), ts=1.0),
-                        dict(agent_record("m", task="ag_feature", passed=False), ts=2.0)])
-        sev, why = A.verdict("m")
-        self.assertEqual(sev, "limited")
-        self.assertTrue(any("on every attempt" in w for w in why))
-
-    def test_a_retry_that_succeeds_clears_the_task(self):
-        A = self.field([dict(agent_record("m", task="ag_feature", passed=False), ts=1.0),
-                        dict(agent_record("m", task="ag_feature", passed=True), ts=2.0)])
-        self.assertEqual(A.verdict("m"), ("suitable", []))
-
-    def test_a_retry_that_succeeds_first_still_clears_the_task(self):
-        # Order in the ledger must not decide it; a task the model has completed is
-        # a task it can complete.
-        A = self.field([dict(agent_record("m", task="ag_feature", passed=True), ts=1.0),
-                        dict(agent_record("m", task="ag_feature", passed=False), ts=2.0)])
-        self.assertEqual(A.verdict("m")[0], "suitable")
-
-    def test_it_cannot_rescue_a_model_the_screen_ruled_out(self):
-        self.write("screen.jsonl", [screen_record("m", "basic", rate=100.0),
-                                    screen_record("m", "hard", rate=47.0)])
-        self.write("probe.jsonl", [probe_record("m")])
-        self.write("agentic.jsonl", [agent_record("m", passed=True, score=100.0)])
-        self.assertEqual(report.analyse(self.cfg, ["m"]).verdict("m")[0], "unsuitable")
-
-    def test_selection_ignores_agent_results_so_it_cannot_be_circular(self):
-        # A model downgraded for having no agent record would be dropped from the
-        # stage on that basis, and so could never acquire one.
-        A = self.field([agent_record("m", passed=False, score=0.0)])
-        self.assertEqual(A.verdict("m", with_agent=False)[0], "suitable")
-        self.assertEqual(A.by_verdict(["suitable"]), ["m"],
-                         "the stage must still pick up a model its own results failed")
-
-
-class TestAgentAttemptsAreGrouped(ReportCase):
-    """The agent ledger appends, so a task measured again leaves several records.
-
-    They are samples of the same task rather than one superseding another, so
-    they collapse to a single row that carries how many attempts were made and
-    how many succeeded.
-    """
-
-    def field(self, agentic):
-        self.write("screen.jsonl", [screen_record("m", "basic", rate=100.0),
-                                    screen_record("m", "hard", rate=100.0)])
-        self.write("probe.jsonl", [probe_record("m")])
-        self.write("agentic.jsonl", agentic)
-        return report.analyse(self.cfg, ["m"])
-
-    def test_repeats_of_one_task_become_one_row_carrying_the_count(self):
-        A = self.field([dict(agent_record("m", task="ag_feature", passed=False), ts=1.0),
-                        dict(agent_record("m", task="ag_feature", passed=False), ts=2.0),
-                        dict(agent_record("m", task="ag_feature", passed=True), ts=3.0)])
-        self.assertEqual(len(A.ag["m"]), 1, "one row per task, not per attempt")
-        row = A.ag["m"][0]
-        self.assertEqual((row["attempts"], row["completed"]), (3, 1))
-
-    def test_different_tasks_are_all_kept(self):
-        A = self.field([dict(agent_record("m", task="ag_feature"), ts=1.0),
-                        dict(agent_record("m", task="ag_module"), ts=2.0)])
-        self.assertEqual({r["task"] for r in A.ag["m"]}, {"ag_feature", "ag_module"})
-
-
-def served(passed=True):
-    """An 18-check result whose `serves` outcome is the thing under test."""
-    names = ["package_layout", "pyproject", "importable", "serves", "seed_three",
-             "task_shape", "create", "read_one", "update", "toggle_done", "delete",
-             "filter_done", "filter_text", "reorder", "persist", "ui_page",
-             "ui_drag", "own_tests"]
-    return [dict(name=n, passed=(passed if n in ("package_layout", "pyproject",
-                                                 "importable", "serves") else passed),
-                 detail="") for n in names]
-
-
-class TestForeignRecordsAreIgnored(ReportCase):
-    """Another tool may share this results directory; its records are not ours.
-
-    The application task now lives in appsift with its own ledger, but records
-    left by an earlier version of this project, or by any other tool writing
-    here, must not appear in the screen's section or in a verdict.
-    """
-
-    def field(self, agentic):
-        self.write("screen.jsonl", [screen_record("m", "basic", rate=100.0),
-                                    screen_record("m", "hard", rate=100.0)])
-        self.write("probe.jsonl", [probe_record("m")])
-        self.write("agentic.jsonl", agentic)
-        return report.analyse(self.cfg, ["m"])
-
-    def stale(self):
-        checks = [dict(name=n, passed=False, detail="")
-                  for n in ("package_layout", "serves", "persist")]
-        return dict(agent_record("m", task="ag_todoapp", passed=False),
-                    checks=checks, ts=1.0, score=0.0)
-
-    def test_the_screen_no_longer_owns_that_task(self):
-        self.assertNotIn("ag_todoapp", [t["id"] for t in report.AGENT_TASKS])
-
-    def test_a_stale_record_is_not_shown(self):
-        self.assertEqual(self.field([self.stale()]).ag["m"], [])
-
-    def test_a_stale_record_does_not_reach_the_verdict(self):
-        A = self.field([self.stale()])
-        self.assertEqual(A.verdict("m"), ("suitable", []),
-                         "another tool's record must not grade a model in silence")
-
-    def test_our_own_records_beside_it_are_unaffected(self):
-        A = self.field([self.stale(),
-                        dict(agent_record("m", task="ag_fixbug", passed=True), ts=2.0)])
-        self.assertEqual([r["task"] for r in A.ag["m"]], ["ag_fixbug"])
-
-
-class TestThePivotIsPerTask(ReportCase):
-    """Each graded task names the check everything else rests on.
-
-    Hard-coding the application's `serves` meant the rule would go dead the
-    moment that task changed or was dropped, and would never apply to the module
-    task, whose equivalent is `importable`.
-    """
-
-    def field(self, agentic):
-        self.write("screen.jsonl", [screen_record("m", "basic", rate=100.0),
-                                    screen_record("m", "hard", rate=100.0)])
-        self.write("probe.jsonl", [probe_record("m")])
-        self.write("agentic.jsonl", agentic)
-        return report.analyse(self.cfg, ["m"])
-
-    def module_record(self, importable, ts=1.0):
-        checks = [dict(name="layout", passed=True, detail=""),
-                  dict(name="importable", passed=importable, detail=""),
-                  dict(name="add", passed=importable, detail="")]
-        return dict(agent_record("m", task="ag_module", passed=False),
-                    checks=checks, ts=ts, score=33.3)
-
-    def test_every_graded_task_declares_one(self):
-        graded = [t for t in report.AGENT_TASKS if t.get("graded")]
-        self.assertTrue(graded)
-        for task in graded:
-            with self.subTest(task=task["id"]):
-                self.assertTrue(task.get("pivot"),
-                                "a graded task must name the check others rest on")
-
-    def test_a_module_that_does_not_import_is_unsuitable(self):
-        A = self.field([self.module_record(importable=False)])
-        sev, why = A.verdict("m")
-        self.assertEqual(sev, "unsuitable")
-        self.assertTrue(any("module never ran" in w for w in why), why)
-
-    def test_a_module_that_imports_is_not_condemned_for_scoring_badly(self):
-        A = self.field([self.module_record(importable=True)])
-        self.assertNotEqual(A.verdict("m")[0], "unsuitable")
-
-    def test_importing_on_any_attempt_clears_it(self):
-        A = self.field([self.module_record(importable=False, ts=1.0),
-                        self.module_record(importable=True, ts=2.0)])
-        self.assertNotEqual(A.verdict("m")[0], "unsuitable")
-
-
-class TestRegradeReportsFlipsOnly(ReportCase):
-    """A record that gains a score has not been re-judged.
-
-    Reporting it as a flip labelled every rescored record `FAIL->PASS`, including
-    tasks the model had passed all along, and buried the two genuine corrections
-    under three hundred and sixty lines of noise.
-    """
-
-    def records(self, **overrides):
-        from tests import reference
-        answer = "```python\n" + reference.HARD["h_cg_roman"] + "\n```"
-        base = dict(model="m", run=1, taskset="hard", task="h_cg_roman",
-                    kind="codegen", passed=True, format_ok=True, detail="ok",
-                    wall=1.0, raw=answer)
-        return [dict(base, **overrides)]
-
-    def run_regrade(self, records):
-        from codesift import regrade
-        self.write("screen_tasks.jsonl", records)
-        out = io.StringIO()
-        regrade.run(self.cfg, stream=out)
-        return out.getvalue()
-
-    def test_a_record_that_only_gains_a_score_is_not_a_flip(self):
-        text = self.run_regrade(self.records())      # no "score" key at all
-        self.assertIn("0 verdict(s) change", text)
-        self.assertNotIn("FAIL->PASS", text)
-        self.assertIn("rescored", text)
-
-    def test_a_real_change_of_verdict_is_still_reported(self):
-        text = self.run_regrade(self.records(passed=False, score=0.0))
-        self.assertIn("1 verdict(s) change", text)
-        self.assertIn("FAIL->PASS", text)
-
-
-class TestAssessmentCardsCarryTheSameFigures(ReportCase):
-    """A model should be readable on its own card, without cross-referencing.
-
-    The assessment card showed the task sets and the probe; the recommendation
-    card showed task time and speed score. Comparing two models meant reading two
-    sections, and a model excluded before scoring appeared only in one of them.
-    """
-
-    FIELDS = ("Basic set", "Hard set", "Task time", "Speed score",
-              "Prefill @48k", "Generation")
 
     def field(self, models):
         screen, probe = [], []
         for name, rate, gen in models:
-            screen += [screen_record(name, "basic", rate=rate),
-                       screen_record(name, "hard", rate=rate)]
+            screen.append(screen_record(name, rate=rate))
             probe.append(probe_record(name, gen=gen))
-        self.write("screen.jsonl", screen)
+        self.write_tasks(screen)
         self.write("probe.jsonl", probe)
         return self.render([m[0] for m in models])
 
-    def card(self, html, model):
-        """The assessment card, not the recommendation one, which comes first."""
-        section = html[html.index("<h2>Assessment</h2>"):]
-        start = section.index(f"<h3>{model}</h3>")
-        return section[start:section.index("</article>", start)]
+    def test_a_scored_model_carries_both_figures_in_one_row(self):
+        section = self.assessed(self.field([("good", 100.0, 60.0)]))
+        row = section[section.index("<th>good"):]
+        row = row[:row.index("</tr>")]
+        self.assertIn('p-suitable', row)
+        self.assertEqual(row.count('class="barcell"'), 2,
+                         "pass rate and speed both belong to the row")
 
-    def test_every_figure_from_the_recommendation_card_is_present(self):
-        html = self.field([("good", 100.0, 60.0)])
-        card = self.card(html, "good")
-        for label in self.FIELDS:
-            with self.subTest(field=label):
-                self.assertIn(f"<dt>{label}</dt>", card)
-
-    def test_a_model_excluded_before_scoring_still_shows_what_it_has(self):
-        # It has no speed score, since scoring never reached it; the figures that
-        # were measured must still appear, and the missing one as absent.
+    def test_a_model_kept_out_of_the_scoring_is_named_with_its_reason(self):
+        # One table over the whole field: a model with nothing measured is in it
+        # with dashes where the figures would be, and the finding that stopped it.
         html = self.field([("good", 100.0, 60.0), ("slow", 100.0, 5.0)])
-        card = self.card(html, "slow")
-        self.assertIn("<dt>Speed score</dt><dd>&mdash;</dd>", card)
-        self.assertIn("<dt>Generation</dt><dd>5 t/s</dd>", card)
-        self.assertIn("<dt>Hard set</dt>", card)
+        row = self.row(self.assessed(html), "slow")
+        self.assertIn("&mdash;", row)
+        self.assertIn("too slow to use", row)
+        self.assertNotIn("barcell", row, "there is no figure to draw a bar from")
 
-    def test_a_missing_figure_is_never_shown_as_a_zero(self):
-        self.write("screen.jsonl", [screen_record("noprobe", "basic", rate=90.0),
-                                    screen_record("noprobe", "hard", rate=90.0)])
-        self.write("probe.jsonl", [])
-        card = self.card(self.render(["noprobe"]), "noprobe")
-        self.assertIn("<dt>Task time</dt><dd>&mdash;</dd>", card)
-        self.assertIn("<dt>Generation</dt><dd>&mdash;</dd>", card)
-        self.assertNotIn("<dd>0s</dd>", card)
+    def test_its_measurements_are_still_on_the_page(self):
+        # Excluded from the ranking, not from the report: what was measured is
+        # still measured, and the detail tables state it.
+        html = self.field([("good", 100.0, 60.0), ("slow", 100.0, 5.0)])
+        self.assertIn("slow", html.split("<h2>Pass Rate</h2>")[1])
+
+    def test_a_clean_model_says_nothing_rather_than_nothing_found(self):
+        section = self.assessed(self.field([("good", 100.0, 60.0)]))
+        self.assertIn('<td class="detail"></td>', section)

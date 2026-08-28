@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Thomas Ascher <thomas.ascher@gmx.at>
+#
+# SPDX-License-Identifier: MIT
 """Runtime configuration, assembled from CLI arguments and the environment."""
 from __future__ import annotations
 
@@ -8,7 +11,32 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-DEFAULT_CTX = 65536
+DEFAULT_OUTPUT = "report.html"
+# The KV cache is what pushes a model off the GPU, not the weights: at 65,536 only
+# five of seventeen models measured were fully resident on a 12GB card, and an 8B
+# model was carrying some 11GB of cache.
+DEFAULT_CTX = 32768
+
+
+def working_depth(ctx: int) -> int:
+    """The prompt size the probe and the context gate measure at.
+
+    Derived from the window rather than fixed, or a lowered window would leave a
+    prompt that cannot fit in it. Three quarters fills the window as a coding
+    session does while leaving room for the reply.
+    """
+    return ctx * 3 // 4
+
+
+def data_dir(output: str | os.PathLike) -> Path:
+    """Where the records for a report belong: beside it, named after it.
+
+    A report and the measurements it was built from are one result, so they are
+    kept together and two reports do not share a store. `report.html` puts them
+    in `report_data`.
+    """
+    output = Path(output)
+    return output.parent / f"{output.stem}_data"
 
 
 def normalise_host(host: str) -> str:
@@ -21,14 +49,15 @@ def normalise_host(host: str) -> str:
 @dataclass
 class Config:
     host: str = DEFAULT_HOST
-    results_dir: Path = Path("results")
+    results_dir: Path = None  # type: ignore[assignment]
     ctx: int = DEFAULT_CTX
     models: list[str] = field(default_factory=list)
     timeout: int = 2400
 
     def __post_init__(self) -> None:
         self.host = normalise_host(self.host)
-        self.results_dir = Path(self.results_dir)
+        self.results_dir = Path(self.results_dir if self.results_dir is not None
+                                else data_dir(DEFAULT_OUTPUT))
 
     @property
     def is_remote(self) -> bool:
@@ -39,17 +68,10 @@ class Config:
         return self.results_dir / name
 
     def resolve_models(self) -> list[str]:
-        """Explicit models if given, otherwise everything installed but discarded.
-
-        Naming a model runs it whatever the screen concluded about it; the discard
-        list only governs what a sweep of the whole server picks up, so a model
-        ruled out once is not measured again by accident.
-        """
+        """Explicit models if given, otherwise everything installed."""
         if self.models:
             return list(self.models)
-        from .prune import read_discarded
-        dropped = set(read_discarded(self.results_dir))
-        return [m for m in installed_models(self.host) if m not in dropped]
+        return installed_models(self.host)
 
 
 def installed_models(host: str) -> list[str]:
@@ -57,29 +79,21 @@ def installed_models(host: str) -> list[str]:
         return sorted(m["name"] for m in json.loads(r.read())["models"])
 
 
+PULL_PREFIX = "ollama pull "
+
+
 def read_model_file(path: str | os.PathLike) -> list[str]:
-    """One model per line; blank lines and # comments ignored."""
+    """One model per line; blank lines and # comments ignored.
+
+    A leading `ollama pull ` is stripped, which is what `discover --write-models`
+    writes: the same file installs the candidates and then names them.
+    """
     out = []
     for line in Path(path).read_text(encoding="utf-8").splitlines():
         line = line.split("#", 1)[0].strip()
+        if line.startswith(PULL_PREFIX):
+            line = line[len(PULL_PREFIX):].strip()
         if line:
             out.append(line)
     return out
 
-
-def parse_kv(text: str) -> dict[str, str]:
-    """Parse lines of the form key=value into a dict.
-
-    Blank lines and lines starting with # are ignored. Whitespace around keys
-    and values is stripped.  A line without '=' raises ValueError.
-    """
-    result: dict[str, str] = {}
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if "=" not in stripped:
-            raise ValueError(f"no '=' found in line: {stripped!r}")
-        key, value = stripped.split("=", 1)
-        result[key.strip()] = value.strip()
-    return result

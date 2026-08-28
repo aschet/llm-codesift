@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Thomas Ascher <thomas.ascher@gmx.at>
+#
+# SPDX-License-Identifier: MIT
 """Grading must be strict in both directions.
 
 A grader that accepts a wrong answer inflates every score; one that rejects a
@@ -7,10 +10,9 @@ import unittest
 
 from codesift import screen
 from codesift.screen import extract_code, grade
-from codesift.tasks import AGENT_TASKS, TASKSETS
+from codesift.tasks import TASKS
 
-BASIC = {t["id"]: t for t in TASKSETS["basic"]}
-HARD = {t["id"]: t for t in TASKSETS["hard"]}
+TASK = {t["id"]: t for t in TASKS}
 
 
 def reply(content="", tool_calls=None):
@@ -41,7 +43,7 @@ class TestExtractCode(unittest.TestCase):
 
 class TestCodegenGrading(unittest.TestCase):
     def test_correct_solution_passes(self):
-        passed, parseable, _, _ = grade(BASIC["cg_version"], reply(
+        passed, parseable, _, _ = grade(TASK["cg_version"], reply(
             "```python\ndef parse_version(s):\n"
             "    p = [int(x) for x in s.split('.')][:3]\n"
             "    return tuple(p + [0] * (3 - len(p)))\n```"))
@@ -50,14 +52,14 @@ class TestCodegenGrading(unittest.TestCase):
 
     def test_plausible_but_wrong_solution_fails(self):
         # Omits zero padding, which the assertions require.
-        passed, parseable, _, _ = grade(BASIC["cg_version"], reply(
+        passed, parseable, _, _ = grade(TASK["cg_version"], reply(
             "```python\ndef parse_version(s):\n"
             "    return tuple(int(x) for x in s.split('.')[:3])\n```"))
         self.assertFalse(passed)
         self.assertTrue(parseable, "code was present, so it was parseable")
 
     def test_prose_without_code_is_unparseable(self):
-        passed, parseable, detail, _ = grade(BASIC["cg_version"], reply(""))
+        passed, parseable, detail, _ = grade(TASK["cg_version"], reply(""))
         self.assertFalse(passed)
         self.assertFalse(parseable)
         self.assertIn("no code", detail)
@@ -65,92 +67,92 @@ class TestCodegenGrading(unittest.TestCase):
 
 class TestTraceGrading(unittest.TestCase):
     def test_exact_answer(self):
-        self.assertTrue(grade(BASIC["tr_closure"], reply("[2, 2, 2]"))[0])
+        self.assertTrue(grade(TASK["tr_closure"], reply("[2, 2, 2]"))[0])
 
     def test_whitespace_is_ignored(self):
-        self.assertTrue(grade(BASIC["tr_closure"], reply("[2,2,2]"))[0])
+        self.assertTrue(grade(TASK["tr_closure"], reply("[2,2,2]"))[0])
 
     def test_wrong_answer(self):
-        self.assertFalse(grade(BASIC["tr_closure"], reply("[0, 1, 2]"))[0])
+        self.assertFalse(grade(TASK["tr_closure"], reply("[0, 1, 2]"))[0])
 
 
 class TestToolCallGrading(unittest.TestCase):
     def test_correct_call(self):
-        self.assertTrue(grade(BASIC["tc_single"],
+        self.assertTrue(grade(TASK["tc_single"],
                               reply("", call("search_files", {"pattern": "config"})))[0])
 
     def test_wrong_tool(self):
-        passed, parseable, _, _ = grade(BASIC["tc_choose"],
+        passed, parseable, _, _ = grade(TASK["tc_choose"],
                                      reply("", call("search_files", {"pattern": "x"})))
         self.assertFalse(passed)
         self.assertTrue(parseable, "a valid call to the wrong tool is still parseable")
 
     def test_missing_call_is_unparseable(self):
-        passed, parseable, _, _ = grade(BASIC["tc_single"], reply("I will look for that"))
+        passed, parseable, _, _ = grade(TASK["tc_single"], reply("I will look for that"))
         self.assertFalse(passed)
         self.assertFalse(parseable)
 
     def test_restraint_answering_directly(self):
-        self.assertTrue(grade(HARD["h_tc_restraint"], reply("42"))[0])
+        self.assertTrue(grade(TASK["tc_restraint"], reply("42"))[0])
 
     def test_restraint_calling_a_tool_fails(self):
-        passed, _, detail, _ = grade(HARD["h_tc_restraint"],
+        passed, _, detail, _ = grade(TASK["tc_restraint"],
                                   reply("", call("search_web", {"query": "17+25"})))
         self.assertFalse(passed)
         self.assertIn("search_web", detail)
 
     def test_argument_types_are_checked(self):
         good = call("create_issue", {"title": "x", "labels": ["bug", "urgent"]})
-        self.assertTrue(grade(HARD["h_tc_nested"], reply("", good))[0])
+        self.assertTrue(grade(TASK["tc_nested"], reply("", good))[0])
         wrong_type = call("create_issue", {"title": "x", "labels": "bug"})
-        self.assertFalse(grade(HARD["h_tc_nested"], reply("", wrong_type))[0])
+        self.assertFalse(grade(TASK["tc_nested"], reply("", wrong_type))[0])
         missing = call("create_issue", {"title": "x"})
-        self.assertFalse(grade(HARD["h_tc_nested"], reply("", missing))[0])
+        self.assertFalse(grade(TASK["tc_nested"], reply("", missing))[0])
 
     def test_arguments_supplied_as_json_string(self):
         encoded = call("create_issue", '{"title": "x", "labels": ["bug"]}')
-        self.assertTrue(grade(HARD["h_tc_nested"], reply("", encoded))[0])
+        self.assertTrue(grade(TASK["tc_nested"], reply("", encoded))[0])
 
     def test_arguments_that_are_not_json(self):
-        passed, parseable, _, _ = grade(HARD["h_tc_nested"], reply("", call("create_issue", "{oops")))
+        passed, parseable, _, _ = grade(TASK["tc_nested"], reply("", call("create_issue", "{oops")))
         self.assertFalse(passed)
         self.assertFalse(parseable)
 
 
 class TestFormatGrading(unittest.TestCase):
     def test_json_exact(self):
-        self.assertTrue(grade(BASIC["fmt_jsononly"],
+        self.assertTrue(grade(TASK["fmt_jsononly"],
                               reply('{"language":"python","year":1991}'))[0])
 
     def test_json_with_wrong_value(self):
-        self.assertFalse(grade(BASIC["fmt_jsononly"],
+        self.assertFalse(grade(TASK["fmt_jsononly"],
                                reply('{"language":"python","year":"1991"}'))[0])
 
     def test_unparseable_json_is_flagged(self):
-        passed, parseable, _, _ = grade(BASIC["fmt_jsononly"], reply("Sure! Here you go."))
+        passed, parseable, _, _ = grade(TASK["fmt_jsononly"], reply("Sure! Here you go."))
         self.assertFalse(passed)
         self.assertFalse(parseable)
 
     def test_one_word(self):
-        self.assertTrue(grade(BASIC["fmt_oneword"], reply("def"))[0])
-        self.assertFalse(grade(BASIC["fmt_oneword"], reply("the def keyword"))[0])
+        self.assertTrue(grade(TASK["fmt_oneword"], reply("def"))[0])
+        self.assertFalse(grade(TASK["fmt_oneword"], reply("the def keyword"))[0])
 
     def test_bare_code_rejects_fences(self):
         passed, parseable, detail, _ = grade(
-            BASIC["fmt_barecode"], reply("```python\ndef add(a, b):\n    return a + b\n```"))
+            TASK["fmt_barecode"], reply("```python\ndef add(a, b):\n    return a + b\n```"))
         self.assertFalse(passed)
         self.assertFalse(parseable)
         self.assertIn("fences", detail)
 
     def test_bare_code_accepts_clean_code(self):
-        self.assertTrue(grade(BASIC["fmt_barecode"],
+        self.assertTrue(grade(TASK["fmt_barecode"],
                               reply("def add(a, b):\n    return a + b"))[0])
 
     def test_no_comments_rejects_each_violation(self):
         body = ("def is_palindrome(s):\n"
                 "    t = [c.lower() for c in s if c.isalnum()]\n"
                 "    return t == t[::-1]")
-        self.assertTrue(grade(HARD["h_fmt_negative"], reply(body))[0])
+        self.assertTrue(grade(TASK["fmt_negative"], reply(body))[0])
         for bad, expected in (
                 (body.replace("def", "# note\ndef"), "comment"),
                 ('def is_palindrome(s):\n    """doc"""\n    return True', "docstring"),
@@ -158,13 +160,13 @@ class TestFormatGrading(unittest.TestCase):
                               "def is_palindrome(s: str) -> bool:"), "type hints"),
                 ("```python\n" + body + "\n```", "fences")):
             with self.subTest(violation=expected):
-                passed, _, detail, _ = grade(HARD["h_fmt_negative"], reply(bad))
+                passed, _, detail, _ = grade(TASK["fmt_negative"], reply(bad))
                 self.assertFalse(passed)
                 self.assertIn(expected, detail)
 
     def test_no_comments_still_requires_correctness(self):
         # Clean, but ignores punctuation and case as the prompt requires.
-        self.assertFalse(grade(HARD["h_fmt_negative"],
+        self.assertFalse(grade(TASK["fmt_negative"],
                                reply("def is_palindrome(s):\n    return s == s[::-1]"))[0])
 
 
@@ -293,7 +295,7 @@ class TestPartialCredit(unittest.TestCase):
     One task's whole discriminating power sat on a single edge case because of it.
     """
 
-    FLATTEN = BASIC["cg_flatten"]
+    FLATTEN = TASK["cg_flatten"]
     CORRECT = ("def flatten(d, sep='.'):\n"
                "    out = {}\n"
                "    for k, v in d.items():\n"
@@ -342,9 +344,9 @@ class TestPartialCredit(unittest.TestCase):
         self.assertEqual(detail, "no code emitted")
 
     def test_setup_that_raises_ends_the_attempt(self):
-        # h_ed_cache builds a cache before examining it; if the constructor throws
+        # ed_cache builds a cache before examining it; if the constructor throws
         # there is nothing left to check, and the checks after it are not credited.
-        passed, _, _, score = grade(HARD["h_ed_cache"],
+        passed, _, _, score = grade(TASK["ed_cache"],
                                     reply("```python\nclass Cache:\n"
                                           "    def __init__(self, n):\n"
                                           "        raise RuntimeError('no')\n```"))
@@ -353,8 +355,8 @@ class TestPartialCredit(unittest.TestCase):
 
     def test_every_other_kind_stays_all_or_nothing(self):
         for task, good, bad in (
-                (BASIC["tr_closure"], "[2, 2, 2]", "[0, 1, 2]"),
-                (BASIC["fmt_oneword"], "def", "a function"),
+                (TASK["tr_closure"], "[2, 2, 2]", "[0, 1, 2]"),
+                (TASK["fmt_oneword"], "def", "a function"),
         ):
             with self.subTest(task=task["id"]):
                 self.assertEqual(grade(task, reply(good))[3], 1.0)

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Thomas Ascher <thomas.ascher@gmx.at>
+#
+# SPDX-License-Identifier: MIT
 """Finds models in the Ollama library that are worth screening.
 
 Screening costs GPU hours, so the shortlist it runs on should be chosen rather
@@ -20,7 +23,7 @@ import re
 import sys
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 
 LIBRARY_URL = "https://ollama.com/library"
@@ -31,18 +34,6 @@ CAP_TOOLS = "tools"
 CAP_CLOUD = "cloud"
 CAP_EMBEDDING = "embedding"
 
-# Architectures whose name does not contain "moe" but which are mixtures of experts,
-# and ones known to be dense. Anything absent from both is reported as printed rather
-# than guessed at, since only the weights themselves settle it.
-MOE_ARCHITECTURES = frozenset({"gptoss", "deepseek2", "deepseek3"})
-DENSE_ARCHITECTURES = frozenset({
-    "llama", "mistral", "mistral3", "gemma", "gemma2", "gemma3", "qwen2", "qwen3",
-    "phi3", "phi4", "starcoder2", "cohere", "cohere2", "olmo2", "nemotron",
-})
-
-# Words that mean a publisher claims the model does programming work. They are
-# reported, and can be required, but they are never weighted into a score: a claim
-# in a description is evidence that the claim was made, and nothing more.
 CODING_WORDS = (
     "code", "coder", "coding", "codebase", "codebases", "programming",
     "software engineering", "swe-bench", "developer", "refactor", "refactoring",
@@ -55,33 +46,17 @@ class LibraryError(RuntimeError):
 
 @dataclass(frozen=True)
 class Variant:
-    """One pullable tag of a model."""
+    """One pullable tag, as the library listing names it.
+
+    Everything here comes off the listing page, which is one request for the whole
+    library. The size badge gives the parameter count; the context window and the
+    architecture are not read from the tag pages, since triage tests the context a
+    model actually holds and the probe times what it actually generates.
+    """
 
     ref: str                     # "qwen3-coder:30b"
-    size_gb: float | None        # download size; None for cloud tags
-    context: int | None          # advertised context window in tokens
-    cloud: bool                  # served by Ollama's cloud, not pullable
-    age: str = ""                # as printed on the page, e.g. "11 months ago"
-    digest: str = ""             # short manifest digest, which identifies the weights
-    arch: str = ""               # architecture as the tag's page names it
-    params: str = ""             # parameter count as the tag's page states it
-
-    @property
-    def moe(self) -> bool | None:
-        """Whether the architecture is a mixture of experts.
-
-        Positive only when the name says so. Several publishers give a mixture of
-        experts a plain family name, so a False here would be a guess; those return
-        None and the architecture is reported as printed for the reader to judge.
-        """
-        if not self.arch:
-            return None
-        name = self.arch.lower()
-        if "moe" in name or name in MOE_ARCHITECTURES:
-            return True
-        if name in DENSE_ARCHITECTURES:
-            return False
-        return None
+    label: str                   # the size badge as printed: "30b", "e4b", "8x7b"
+    params_b: float | None       # parameter count in billions, or None if unstated
 
     @property
     def tag(self) -> str:
@@ -108,6 +83,16 @@ class LibraryModel:
     def is_embedding(self) -> bool:
         return CAP_EMBEDDING in self.capabilities
 
+    @property
+    def cloud_only(self) -> bool:
+        """Served by Ollama's cloud with nothing to download.
+
+        A cloud badge alone does not mean that: gemma4 and qwen3.5 are offered both
+        ways and list their local sizes. A cloud badge with no size badge does --
+        there is no tag to pull, so screening it locally is impossible.
+        """
+        return CAP_CLOUD in self.capabilities and not self.sizes
+
 
 @dataclass
 class Suggestion:
@@ -124,18 +109,14 @@ class Suggestion:
 
     def as_dict(self) -> dict:
         return dict(model=self.model.name, ref=self.variant.ref,
-                    size_gb=self.variant.size_gb, context=self.variant.context,
-                    arch=self.variant.arch, params=self.variant.params,
-                    moe=self.variant.moe,
-                    updated=self.model.updated.isoformat() if self.model.updated else None,
+                    params_b=self.variant.params_b,
                     pulls=self.model.pulls,
+                    updated=self.model.updated.isoformat() if self.model.updated else None,
                     capabilities=list(self.model.capabilities),
-                    installed=self.installed, have=list(self.have),
                     coding_words=list(self.coding_words),
+                    installed=self.installed, have=list(self.have),
                     description=self.model.description)
 
-
-# ---------------------------------------------------------------- fetching
 
 def _get(url: str, timeout: float) -> str:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
@@ -146,37 +127,10 @@ def _get(url: str, timeout: float) -> str:
         raise LibraryError(f"{url}: {exc}") from exc
 
 
-class Fetcher:
-    """Reads library pages, keeping a copy on disk.
-
-    The listing changes daily at most, so repeated runs during a screening session
-    should not re-request it. A cached page older than the lifetime is refetched.
-    """
-
-    def __init__(self, cache_dir: Path | None = None, ttl_hours: float = 24.0,
-                 timeout: float = 30.0, refresh: bool = False) -> None:
-        self.cache_dir = Path(cache_dir) if cache_dir else None
-        self.ttl = ttl_hours * 3600
-        self.timeout = timeout
-        self.refresh = refresh
-
-    def _cache_path(self, url: str) -> Path | None:
-        if not self.cache_dir:
-            return None
-        slug = re.sub(r"[^A-Za-z0-9]+", "_", url.split("://", 1)[-1]).strip("_")
-        return self.cache_dir / f"{slug}.html"
-
-    def get(self, url: str) -> str:
-        path = self._cache_path(url)
-        if path and path.exists() and not self.refresh:
-            age = dt.datetime.now().timestamp() - path.stat().st_mtime
-            if age < self.ttl:
-                return path.read_text(encoding="utf-8")
-        body = _get(url, self.timeout)
-        if path:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(body, encoding="utf-8")
-        return body
+def fetch(url: str, timeout: float = 30.0) -> str:
+    """One request, no cache: it costs about half a second, and a cached listing
+    could hand back a stale view of a library that exists to say what is new."""
+    return _get(url, timeout)
 
 
 # ---------------------------------------------------------------- parsing
@@ -202,18 +156,6 @@ def _pulls(value: str) -> int:
         return int(float(m.group(1)) * scale)
     except ValueError:
         return 0
-
-
-def _context(value: str) -> int | None:
-    """"256K" as printed beside a tag."""
-    m = re.match(r"([\d.]+)\s*([KM]?)", value.strip(), re.I)
-    if not m:
-        return None
-    scale = {"": 1, "K": 1024, "M": 1024 * 1024}[m.group(2).upper()]
-    try:
-        return int(float(m.group(1)) * scale)
-    except ValueError:
-        return None
 
 
 def parse_index(page: str) -> list[LibraryModel]:
@@ -255,80 +197,26 @@ def _updated(card: str) -> dt.date | None:
         return None
 
 
-_ARCH = re.compile(r"model arch (\S+)\s*[\u00b7&#183;]*\s*parameters (\S+)")
+_SIZE = re.compile(r"^([\d.]+)([bm])$", re.I)          # 30b, 9b, 270m
 
 
-def parse_model_page(page: str) -> tuple[str, str]:
-    """Architecture and parameter count, as the page for one tag prints them."""
-    text = _squash(_text(page))
-    m = re.search(r"model arch (\S+) . parameters (\S+)", text)
-    return (m.group(1), m.group(2)) if m else ("", "")
+def parse_size(label: str) -> float | None:
+    """A size badge as a parameter count in billions, or None if it does not state one.
 
+    Only plain counts are read. The other two forms look like numbers and are not:
+    `e4b` is an effective count, and the model behind gemma4:e4b reports 8.0B
+    parameters and ships 9.61GB, so reading it as four billion understates it by
+    half. `8x7b` names experts, and Mixtral 8x7B totals about 46.7B rather than the
+    56B the multiplication gives, because the experts share layers.
 
-def parse_tags(name: str, page: str) -> list[Variant]:
-    """Read a model's tag page.
-
-    Local tags print a download size; cloud tags print a usage tier in the same
-    position, which is how the two are told apart.
+    A badge that cannot be read honestly is left unstated rather than guessed. The
+    label itself is still printed, so the reader sees `e4b` and judges it.
     """
-    out: list[Variant] = []
-    seen: set[str] = set()
-    pattern = re.compile(r'href="/library/(' + re.escape(name) + r':[^"]+)"')
-    parts = pattern.split(page)
-    # split() yields [prefix, ref, body, ref, body, ...]
-    for ref, body in zip(parts[1::2], parts[2::2]):
-        ref = html.unescape(ref)
-        if ref in seen:
-            continue
-        seen.add(ref)
-        text = _squash(_text(body[:4000]))
-        size = re.search(r"([\d.]+)\s*GB\b", text)
-        ctx = re.search(r"([\d.]+[KM]?)\s*context window", text)
-        age = re.search(r"(\d+ \w+ ago|yesterday|today)", text)
-        digest = re.search(r"\b([0-9a-f]{12})\b", text)
-        cloud = size is None and re.search(r"\b\w+ Usage\b", text) is not None
-        out.append(Variant(ref=ref,
-                           size_gb=float(size.group(1)) if size else None,
-                           context=_context(ctx.group(1)) if ctx else None,
-                           cloud=cloud,
-                           age=age.group(1) if age else "",
-                           digest=digest.group(1) if digest else ""))
-    return out
-
-
-# ---------------------------------------------------------------- selection
-
-# A tag naming only a parameter count is the publisher's default build, which for
-# almost every model in the library means Q4_K_M. Fully qualified tags exist beside
-# it at other quantisations, and picking the largest of those would suggest an fp16
-# or q8 weight set where the intended download is a quarter of the size.
-_PLAIN_TAG = re.compile(r"^(latest|[\d.]+[bm]|[\d.]+x[\d.]+b)$", re.I)
-
-
-def _best_variant(variants: list[Variant], max_size_gb: float | None,
-                  min_context: int | None, min_size_gb: float = 0.0) -> Variant | None:
-    """The largest default build that still fits, since larger is generally stronger.
-
-    Tags whose page states no size are treated as unknown rather than as fitting:
-    a suggestion the machine cannot run wastes more time than one it never made.
-    """
-    usable = [v for v in variants if not v.cloud and v.size_gb is not None]
-    if max_size_gb is not None:
-        usable = [v for v in usable if v.size_gb <= max_size_gb]
-    if min_size_gb:
-        usable = [v for v in usable if v.size_gb >= min_size_gb]
-    if min_context is not None:
-        usable = [v for v in usable if v.context is None or v.context >= min_context]
-    if not usable:
+    m = _SIZE.match(label)
+    if not m:
         return None
-    plain = [v for v in usable if _PLAIN_TAG.match(v.tag)]
-    if not plain:
-        # Some publishers ship only qualified tags; take the customary quantisation.
-        plain = [v for v in usable if "q4" in v.tag.lower()] or usable
-    # Among tags of the same size, prefer the more specific name: ":latest" duplicates
-    # a numbered tag and does not say which build was measured.
-    plain.sort(key=lambda v: (v.size_gb or 0, v.tag != "latest", -len(v.tag)))
-    return plain[-1]
+    n = float(m.group(1))
+    return n if m.group(2).lower() == "b" else n / 1000
 
 
 SORTS = ("date", "name")
@@ -350,40 +238,67 @@ def coding_claims(model: LibraryModel) -> tuple[str, ...]:
     return tuple(w for w in CODING_WORDS if _mentions(w, text))
 
 
-def suggest(models: list[LibraryModel], fetcher: Fetcher, *,
-            max_size_gb: float | None = None,
-            min_size_gb: float = 0.0,
-            min_context: int | None = None,
+def pick_variant(model: LibraryModel, max_b: float | None,
+                 min_b: float) -> Variant | None:
+    """The largest tag within the parameter limits, or None if nothing fits.
+
+    Largest, because a bigger model is the better screening candidate when both
+    fit -- the point of a limit is to name what the card can hold, not to prefer
+    the smallest thing under it.
+
+    A badge that states no readable count -- `e4b`, `8x7b` -- cannot be ranked or
+    limited, so it is used only when a model offers nothing else, and then the last
+    one listed is taken, the listing being in ascending order. A model with no badge
+    at all is offered as `latest`, which is how such a model is pulled. Both carry
+    no parameter count rather than a guessed one, and neither is size-limited, since
+    there is no size to test.
+    """
+    sized = [(b, s) for b, s in ((parse_size(s), s) for s in model.sizes)
+             if b is not None]
+    if not sized:
+        if model.sizes:
+            return Variant(f"{model.name}:{model.sizes[-1]}", model.sizes[-1], None)
+        return Variant(f"{model.name}:latest", "latest", None)
+    fits = [(b, s) for b, s in sized if (max_b is None or b <= max_b) and b >= min_b]
+    if not fits:
+        return None
+    b, label = max(fits)
+    return Variant(f"{model.name}:{label}", label, b)
+
+
+def suggest(models: list[LibraryModel], *,
+            max_params_b: float | None = None,
+            min_params_b: float = 0.0,
             since: dt.date | None = None,
             require_coding: bool = False,
             match: str | None = None,
             exclude: str | None = None,
             installed: set[str] | None = None,
             include_installed: bool = False,
-            limit: int = 20,
             sort: str = "date",
             on_skip=None) -> list[Suggestion]:
     """Keep the models that meet every stated constraint, in the requested order.
 
-    Each constraint is a fact printed on the page: a capability badge, a date, a
-    download size, a context window. Ordering is by one of those facts too. What the
-    publisher claims about a model's ability is carried through as its description
-    and left for the reader, since the listing offers no way to test it.
+    Every constraint is a fact the listing prints: a capability badge, a date, a
+    size badge, the publisher's own description. One request answers all of them,
+    so this reads the whole library in about a second.
 
-    The listing alone settles capability, age and text, and is one request. Only
-    models that pass those are looked up individually, so tag pages are fetched for
-    a shortlist rather than for the whole library.
+    What the publisher claims about a model's ability is carried through as its
+    description and left for the reader, since the listing offers no way to test it.
+    Nothing here is a measurement -- the stages after it are.
     """
     installed = installed or set()
-    kept: list[LibraryModel] = []
     hunt = re.compile(match, re.I) if match else None
     drop = re.compile(exclude, re.I) if exclude else None
 
+    kept: list[LibraryModel] = []
     for model in models:
         if model.is_embedding:
             continue           # nothing to prompt: it returns vectors
         if not model.has_tools:
             continue           # a harness drives a model through tools or not at all
+        if model.cloud_only:
+            continue           # served by Ollama's cloud and never pullable
         if since and (not model.updated or model.updated < since):
             continue           # too old, or carries no date to show it is not
         if require_coding and not coding_claims(model):
@@ -395,47 +310,29 @@ def suggest(models: list[LibraryModel], fetcher: Fetcher, *,
             continue
         kept.append(model)
 
-    # Ordering by download size would mean fetching every candidate's tag page before
-    # any could be ranked, so size is a filter here rather than an ordering. Pull
-    # counts are not offered as one either: they accumulate with age, so ranking by
-    # them buries exactly the recent models this is meant to surface.
+    # Not by pulls: they accumulate with age, so ranking on them buries exactly
+    # the recent models this exists to surface.
     order = {
         "date": lambda m: (m.updated or dt.date.min, m.name),
         "name": lambda m: m.name,
     }
     kept.sort(key=order.get(sort, order["date"]), reverse=(sort != "name"))
 
+    # Not capped: the filters are what narrow the list, and cutting a sorted list
+    # at some length drops matches for no reason the reader can see.
     out: list[Suggestion] = []
     for model in kept:
-        if len(out) >= limit:
-            break
-        try:
-            variants = parse_tags(model.name, fetcher.get(f"{LIBRARY_URL}/{model.name}/tags"))
-        except LibraryError as exc:
-            if on_skip:
-                on_skip(model.name, str(exc))
-            continue
-        variant = _best_variant(variants, max_size_gb, min_context, min_size_gb)
+        variant = pick_variant(model, max_params_b, min_params_b)
         if variant is None:
             if on_skip:
-                on_skip(model.name, "no local tag within the size and context limits")
+                on_skip(model.name, "no tag within the parameter limits")
             continue
-        # The architecture lives on the page for the individual tag, and decides more
-        # about how a model behaves on a given card than its parameter count does.
-        try:
-            arch, params = parse_model_page(fetcher.get(f"{LIBRARY_URL}/{variant.ref}"))
-            variant = replace(variant, arch=arch, params=params)
-        except LibraryError:
-            pass               # the size and context already justify the suggestion
-        # Whether a model is already held is a question about the weights, not the
-        # name: having gemma4:26b says nothing about gemma4:31b, which has never been
-        # measured, while :latest and :q4_K_M are routinely the same download under
-        # two names. The manifest digest settles both cases; sibling tags are reported.
+        # Sibling tags are reported rather than counted as having it: holding
+        # gemma4:26b says nothing about gemma4:31b, which has never been measured.
         have = tuple(sorted(n for n in installed
                             if ":" in n and n.partition(":")[0] == model.name
                             and n != variant.ref))
-        already = variant.ref in installed or bool(
-            variant.digest and variant.digest in installed)
+        already = variant.ref in installed
         if already and not include_installed:
             continue
         out.append(Suggestion(model=model, variant=variant, installed=already, have=have))
@@ -482,52 +379,44 @@ def parse_since(value: str, today: dt.date | None = None) -> dt.date:
         raise ValueError(f"cannot read {value!r} as a date, year, or month count") from exc
 
 
-def _table(rows: list[Suggestion], width: int = 64) -> str:
-    """Every column is copied from the listing; the description is the publisher's."""
-    head = ("#", "model", "arch", "params", "size", "context", "updated", "you have",
-            "coding words", "described as")
+def _table(rows: list[Suggestion]) -> str:
+    """Every column is copied from the listing, and only what bears on whether to
+    screen a model. The pull count is left out, since it measures how long a model
+    has been popular rather than whether it is worth an hour of GPU time, and so is
+    the description, which does not survive a cut to terminal width. `--json`
+    carries everything.
+    """
+    head = ("model", "params", "updated", "coding")
     body = []
-    for i, s in enumerate(rows, 1):
-        desc = s.model.description
+    for s in rows:
         body.append((
-            str(i),
             s.variant.ref + (" *" if s.installed else ""),
-            (s.variant.arch or "-") + (" moe" if s.variant.moe else ""),
-            s.variant.params or "-",
-            f"{s.variant.size_gb:.0f}GB" if s.variant.size_gb is not None else "-",
-            f"{s.variant.context // 1024}K" if s.variant.context else "-",
+            f"{s.variant.params_b:g}B" if s.variant.params_b else "-",
             f"{s.model.updated:%Y-%m}" if s.model.updated else "-",
-            ", ".join(t.partition(":")[2] for t in s.have[:2]) or "-",
-            ", ".join(s.coding_words[:3]) or "-",
-            desc if len(desc) <= width else desc[:width - 1].rstrip() + "\u2026",
+            # Whether the listing claims programming work, not which words it used.
+            "yes" if s.coding_words else "no",
         ))
-    widths = [max(len(r[i]) for r in (head, *body)) for i in range(len(head) - 1)]
-    lines = []
-    for row in (head, *body):
-        cells = [c.ljust(w) for c, w in zip(row, widths)] + [row[-1]]
-        lines.append("  ".join(cells).rstrip())
+    widths = [max(len(r[i]) for r in (head, *body)) for i in range(len(head))]
+    lines = ["  ".join(c.ljust(w) for c, w in zip(row, widths)).rstrip()
+             for row in (head, *body)]
     lines.insert(1, "  ".join("-" * w for w in widths))
     return "\n".join(lines)
 
 
-def run(cfg, *, since: str = "18m", max_size_gb: float | None = 32.0,
-        min_size_gb: float = 4.0, min_context: int | None = None,
+def run(cfg, *, since: str = "18m", max_params_b: float | None = 70.0,
+        min_params_b: float = 4.0,
         require_coding: bool = False,
         match: str | None = None,
         exclude: str | None = None,
-        include_installed: bool = False, limit: int = 20, sort: str = "date",
+        include_installed: bool = False, sort: str = "date",
         as_json: bool = False, write_models: Path | None = None,
-        cache_dir: Path | None = None, refresh: bool = False,
-        fetcher: Fetcher | None = None, stream=None) -> int:
+        fetcher=None, stream=None) -> int:
     """Print the models worth screening, and optionally write them as a model list."""
     stream = stream or sys.stdout
     cutoff = parse_since(since)
-    min_context = cfg.ctx if min_context is None else min_context
-    fetcher = fetcher or Fetcher(cache_dir or cfg.results_dir / "library-cache",
-                                 refresh=refresh)
-
+    read = fetcher.get if fetcher is not None else fetch
     try:
-        models = parse_index(fetcher.get(LIBRARY_URL))
+        models = parse_index(read(LIBRARY_URL))
     except LibraryError as exc:
         print(f"could not read the library listing: {exc}", file=sys.stderr)
         return 1
@@ -537,22 +426,22 @@ def run(cfg, *, since: str = "18m", max_size_gb: float | None = 32.0,
         return 1
 
     skipped: list[str] = []
-    picks = suggest(models, fetcher,
-                    max_size_gb=max_size_gb, min_size_gb=min_size_gb,
-                    min_context=min_context, since=cutoff,
-                    match=match, exclude=exclude,
+    picks = suggest(models,
+                    max_params_b=max_params_b, min_params_b=min_params_b,
+                    since=cutoff, match=match, exclude=exclude,
                     require_coding=require_coding,
                     installed=installed_names(cfg.host),
-                    include_installed=include_installed, limit=limit, sort=sort,
+                    include_installed=include_installed, sort=sort,
                     on_skip=lambda name, why: skipped.append(f"{name}: {why}"))
 
     if as_json:
         json.dump([s.as_dict() for s in picks], stream, indent=2)
         stream.write("\n")
     else:
+        span = (f"{min_params_b:g}B to {max_params_b:g}B" if max_params_b
+                else f"{min_params_b:g}B and up")
         print(f"{len(models)} models listed, {len(picks)} worth screening "
-              f"(updated since {cutoff}, {min_size_gb:g} to {max_size_gb:g}GB, "
-              f"at least {min_context // 1024}K context, tool calling"
+              f"(updated since {cutoff}, {span}, tool calling"
               f"{', naming coding work' if require_coding else ''}), "
               f"by {sort}", file=stream)
         print(file=stream)
@@ -563,8 +452,12 @@ def run(cfg, *, since: str = "18m", max_size_gb: float | None = 32.0,
     if write_models:
         write_models = Path(write_models)
         write_models.parent.mkdir(parents=True, exist_ok=True)
+        # Written as pull commands rather than as bare names: nothing can be
+        # screened before it is installed, and `--models-file` strips the prefix
+        # back off, so one file serves both steps.
         write_models.write_text(
             "\n".join([f"# suggested by codesift discover on {dt.date.today()}"]
-                      + [s.variant.ref for s in picks]) + "\n", encoding="utf-8")
+                      + [f"ollama pull {s.variant.ref}" for s in picks]) + "\n",
+            encoding="utf-8")
         print(f"wrote {write_models}", file=sys.stderr)
     return 0

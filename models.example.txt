@@ -1,5 +1,7 @@
-# One model per line. Blank lines and comments are ignored.
+# One model per line. Blank lines and comments are ignored, and a leading
+# `ollama pull ` is stripped -- so the file `codesift discover --write-models`
+# writes can be passed straight back in.
 # Pass with: codesift run --models-file models.example.txt
-qwen3:14b
-granite4:8b
-gemma3:12b
+ollama pull qwen3.5:9b
+ollama pull granite4.1:8b
+ollama pull gemma4:12b

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Thomas Ascher <thomas.ascher@gmx.at>
+#
+# SPDX-License-Identifier: MIT
 """Re-apply the grader to replies already recorded, without touching the GPU.
 
 A grading fix is worthless if the only way to benefit from it is to re-run every
@@ -18,9 +21,10 @@ import shutil
 import sys
 from pathlib import Path
 
+from . import args
 from .config import Config
 from .screen import RAW_KEPT, grade
-from .tasks import TASKSETS
+from .tasks import TASKS
 
 # The excerpt length in force before RAW_KEPT was raised. A reply of exactly this
 # length was almost certainly cut at it.
@@ -31,12 +35,8 @@ OLD_RAW_CAP = 2000
 # traces and formats from short answers that were never near the cap.
 CODE_KINDS = ("codegen", "edit")
 
-LEGACY = {"tasks": "basic", "tasks_hard": "hard"}
-
-
 def task_for(rec: dict) -> dict | None:
-    name = LEGACY.get(rec.get("taskset")) or rec.get("taskset") or "basic"
-    for task in TASKSETS.get(name, []):
+    for task in TASKS:
         if task["id"] == rec.get("task"):
             return task
     return None
@@ -66,30 +66,12 @@ def regrade(rec: dict) -> tuple[dict, str]:
     return out, "changed"
 
 
-def _summarise(rows: list[dict]) -> None:
-    """Recompute a summary's rates from the task records it carries."""
-    for row in rows:
-        tasks = row.get("tasks") or []
-        if not tasks:
-            continue
-        from .screen import _score
-        n = len(tasks)
-        row["n"] = n
-        row["passed"] = sum(1 for t in tasks if t.get("passed"))
-        row["pass_rate"] = round(100 * sum(_score(t) for t in tasks) / n, 1)
-        row["fully_passed_rate"] = round(100 * row["passed"] / n, 1)
-        row["format_ok_rate"] = round(
-            100 * sum(1 for t in tasks if t.get("format_ok")) / n, 1)
-        row["hit_cap_n"] = sum(1 for t in tasks if t.get("hit_cap"))
-
-
 def run(cfg: Config, apply: bool = False, stream=None) -> int:
     out = stream or sys.stdout
     tally = {"changed": 0, "same": 0, "unverifiable": 0, "skipped": 0}
     flips, unsure = [], {}
 
     ledger = Path(cfg.results_dir) / "screen_tasks.jsonl"
-    summary = Path(cfg.results_dir) / "screen.jsonl"
     if not ledger.exists():
         print("no screen_tasks.jsonl; nothing to regrade", file=out)
         return 0
@@ -97,11 +79,10 @@ def run(cfg: Config, apply: bool = False, stream=None) -> int:
     def note(rec, before, status):
         tally[status] += 1
         # Only a changed verdict is a flip. A record that merely gained a score it
-        # never carried has not been re-judged, and reporting it as one buried two
-        # real corrections under three hundred and sixty lines of noise.
+        # never carried has not been re-judged.
         if status == "changed" and before != rec["passed"]:
-            flips.append((rec["model"], rec.get("taskset") or "basic", rec.get("run"),
-                          rec["task"], before, rec["passed"]))
+            flips.append((rec["model"], rec.get("run"), rec["task"],
+                          before, rec["passed"]))
         elif status == "unverifiable":
             unsure[rec["model"]] = unsure.get(rec["model"], 0) + 1
 
@@ -117,24 +98,12 @@ def run(cfg: Config, apply: bool = False, stream=None) -> int:
         note(rec, before, status)
         new_ledger.append(json.dumps(rec))
 
-    new_summary = []
-    if summary.exists():
-        for line in summary.read_text(encoding="utf-8").splitlines():
-            try:
-                row = json.loads(line)
-            except Exception:
-                new_summary.append(line)
-                continue
-            row["tasks"] = [regrade(t)[0] for t in (row.get("tasks") or [])]
-            new_summary.append(row)
-        _summarise([r for r in new_summary if isinstance(r, dict)])
-
     print(f"{len(flips)} verdict(s) change, {tally['changed'] - len(flips)} rescored, "
           f"{tally['same']} unchanged, {tally['unverifiable']} unverifiable, "
           f"{tally['skipped']} not code tasks", file=out)
-    for model, taskset, run_i, task, before, after in flips:
+    for model, run_i, task, before, after in flips:
         print(f"  {'FAIL->PASS' if after else 'PASS->FAIL'}  {model:26} "
-              f"{taskset:6} run{run_i} {task}", file=out)
+              f"run{run_i} {task}", file=out)
     if unsure:
         print("\nreplies cut at the old 2000-character store, which keep their "
               "original result and need a re-run to settle:", file=out)
@@ -145,13 +114,21 @@ def run(cfg: Config, apply: bool = False, stream=None) -> int:
         print("\nDry run. Pass --apply to rewrite the records.", file=out)
         return 0
 
-    for path, lines in ((ledger, new_ledger), (summary, new_summary)):
-        if not path.exists():
-            continue
-        shutil.copy(path, str(path) + ".bak")
-        path.write_text("".join(
-            (line if isinstance(line, str) else json.dumps(line)) + "\n"
-            for line in lines), encoding="utf-8")
-    print(f"\nrewrote {ledger.name} and {summary.name}; originals kept as .bak",
-          file=out)
+    shutil.copy(ledger, str(ledger) + ".bak")
+    ledger.write_text("".join(
+        (line if isinstance(line, str) else json.dumps(line)) + "\n"
+        for line in new_ledger), encoding="utf-8")
+    print(f"\nrewrote {ledger.name}; the original is kept as .bak", file=out)
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = args.stage("regrade", "Re-apply the grader to replies already recorded.",
+                        models=False, measuring=False, executes=True)
+    parser.add_argument("--apply", action="store_true")
+    a = parser.parse_args(argv)
+    return run(args.config_from(a), apply=a.apply)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

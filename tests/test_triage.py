@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Thomas Ascher <thomas.ascher@gmx.at>
+#
+# SPDX-License-Identifier: MIT
 """The cascade must reject early, and must never reject for the wrong reason.
 
 Two properties matter. A model that fails a cheap gate must not go on to pay for
@@ -12,11 +15,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from codesift import screen, triage
-from codesift.tasks import TASKSETS
+from codesift import progress, screen, triage
+from codesift.tasks import TASKS
 from tests import reference
 from codesift.config import Config
-from codesift.report import MIN_GEN_TOK_S
+from codesift.analysis import MIN_GEN_TOK_S
 
 OFFLINE = "http://127.0.0.1:1"
 
@@ -29,25 +32,24 @@ OFFLINE = "http://127.0.0.1:1"
 # Answers come from tests/reference.perfect_answer, which derives them from each
 # task's own definition, so the gates are exercised through the real grader.
 ANSWERS = {task["prompt"]: reference.perfect_answer(task)
-           for name in TASKSETS for task in TASKSETS[name]}
+           for task in TASKS}
 
 
 class FakeClient:
     """A model whose behaviour at each gate is dictated by the test."""
 
-    def __init__(self, gen=60.0, tool_ok=True, hard_pass=True,
-                 truncated=False, retrieved=True):
+    def __init__(self, gen=60.0, tool_ok=True, answers_well=True, truncated=False):
         self.gen, self.tool_ok = gen, tool_ok
-        self.hard_pass, self.truncated, self.retrieved = hard_pass, truncated, retrieved
+        self.answers_well, self.truncated = answers_well, truncated
         self.deep_calls = 0
         self.task_calls = 0
 
     def chat(self, model, prompt, ctx=None, num_predict=None, tools=None):
-        if "DEPLOY_TOKEN" in prompt:                      # the deep probe
+        if "codebase excerpt" in prompt:                  # the deep probe
             self.deep_calls += 1
-            return {"message": {"content": "quartz-mongoose-8814" if self.retrieved else "no"},
-                    "_wall": 1.0, "prompt_eval_count": 100 if self.truncated else 10 ** 6,
-                    "prompt_eval_duration": 10 ** 9, "eval_count": 10,
+            return {"message": {"content": "OK"}, "_wall": 1.0,
+                    "prompt_eval_count": 100 if self.truncated else 10 ** 6,
+                    "prompt_eval_duration": 10 ** 9, "eval_count": 1,
                     "eval_duration": 10 ** 9}
         if tools:
             self.task_calls += 1
@@ -60,7 +62,7 @@ class FakeClient:
                     "load_duration": 10 ** 9}
         self.task_calls += 1
         answer = ANSWERS.get(prompt.split("\n\n```python")[0])
-        msg = answer if (self.hard_pass and answer) else {"content": "nope"}
+        msg = answer if (self.answers_well and answer) else {"content": "nope"}
         return {"message": msg, "_wall": 0.1, "eval_count": 5, "eval_duration": 10 ** 8}
 
     def placement(self, model):
@@ -75,6 +77,7 @@ class FakeClient:
 
 class TriageCase(unittest.TestCase):
     def setUp(self):
+        progress.reset()
         self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.cfg = Config(host=OFFLINE, results_dir=self.tmp, models=["m:1"], ctx=65536)
         self.enterContext(mock.patch.object(triage.gpulock, "acquire"))
@@ -88,56 +91,82 @@ class TriageCase(unittest.TestCase):
     def ledger(self):
         return triage.read_ledger(self.cfg)
 
+    def codes(self, model="m:1"):
+        """What the gates found, from the record rather than from the printout.
+
+        A gate's verdict is what these tests are about; how it is displayed is
+        progress.py's business and changes without any of this changing.
+        """
+        return [f["code"] for f in self.ledger()[model]["findings"]]
+
 
 class TestEarlyExit(TriageCase):
     def test_a_slow_model_never_pays_for_the_deep_probe(self):
         client = FakeClient(gen=MIN_GEN_TOK_S - 5)
-        text = self.go(client)
+        self.go(client)
         self.assertEqual(client.deep_calls, 0, "the expensive gate must not be reached")
         self.assertEqual(client.task_calls, 0, "no task should have been graded")
-        self.assertIn("REJECTED at speed", text)
+        self.assertEqual(self.codes(), ["slow_generation"])
         self.assertFalse(self.ledger()["m:1"]["passed"])
 
-    def test_a_model_that_cannot_call_a_tool_never_reaches_the_hard_set(self):
+    def test_a_model_that_cannot_call_a_tool_is_not_graded_further(self):
         client = FakeClient(tool_ok=False)
-        text = self.go(client)
-        self.assertIn("REJECTED at tools", text)
+        self.go(client)
+        self.assertEqual(self.codes(), ["malformed_tool_calls"])
         self.assertEqual(client.deep_calls, 0)
-        # only the two tool tasks were graded, not the fifteen hard ones
+        # only the tool tasks were graded, not the rest of the set
         self.assertLessEqual(client.task_calls, 4)
 
-    def test_a_weak_model_never_pays_for_the_deep_probe_either(self):
-        client = FakeClient(hard_pass=False)
-        text = self.go(client)
-        self.assertIn("REJECTED at quality", text)
-        self.assertEqual(client.deep_calls, 0)
+    def test_a_model_that_answers_poorly_is_no_longer_rejected_here(self):
+        # Quality gated access to the expensive measurement and predicted it badly:
+        # one model rejected at 67% went on to meet seventeen of
+        # eighteen requirements building an application.
+        client = FakeClient(answers_well=False)
+        self.go(client)
+        self.assertTrue(self.ledger()["m:1"]["passed"])
+        self.assertNotIn("quality", " ".join(self.codes()))
 
     def test_context_is_checked_last_and_only_for_survivors(self):
         client = FakeClient(truncated=True)
-        text = self.go(client)
-        self.assertIn("REJECTED at context", text)
+        self.go(client)
+        self.assertEqual(self.codes(), ["context_truncated"])
         self.assertEqual(client.deep_calls, 1, "reached, but only after the cheap gates")
+
+    def test_a_fault_at_depth_is_recorded_but_does_not_stop_the_model(self):
+        # It is frequently a good model at short prompts, and rejecting it here
+        # means the screen never runs and the report can say neither thing.
+        self.go(FakeClient(truncated=True))
+        self.assertTrue(self.ledger()["m:1"]["passed"], "it must go on to be screened")
+        self.assertEqual(self.codes(), ["context_truncated"],
+                         "and the finding must survive")
 
     def test_a_good_model_clears_every_gate(self):
         client = FakeClient()
-        text = self.go(client)
-        self.assertIn("CLEARED", text)
+        self.go(client)
+        # A cleared model records no finding: `passed` says it, and every such row
+        # carried one reading "cleared every gate" for no reader.
+        self.assertEqual(self.codes(), [])
         self.assertTrue(self.ledger()["m:1"]["passed"])
         self.assertEqual(client.deep_calls, 1)
 
 
 class TestGateOrder(TriageCase):
     def test_the_order_runs_cheapest_first(self):
-        # Taken from measured cost: a shallow call is seconds, the hard set is a
-        # minute or so, the deep prompt is longer still.
-        self.assertEqual(triage.GATES, ("speed", "tools", "quality", "context"))
+        # Taken from measured cost: a shallow call is seconds, the deep prompt is
+        # a minute or more.
+        self.assertEqual(triage.GATES, ("speed", "tools", "context"))
+
+    def test_every_gate_tests_something_a_model_can_or_cannot_do(self):
+        # Not how well it does it. A gate that scores quality decides whether the
+        # expensive measurement ever happens, on a proxy that predicts it poorly.
+        self.assertNotIn("quality", triage.GATES)
+        self.assertFalse(hasattr(triage, "MIN_HARD_RATE"))
 
     def test_the_thresholds_are_the_report_s_own(self):
         # A model triage rejects must be one the full run would also reject, or the
         # two disagree about the same model and neither can be trusted.
-        from codesift import report
-        self.assertEqual(triage.MIN_GEN_TOK_S, report.MIN_GEN_TOK_S)
-        self.assertEqual(triage.MIN_HARD_RATE, 70.0)
+        from codesift import analysis
+        self.assertEqual(triage.MIN_GEN_TOK_S, analysis.MIN_GEN_TOK_S)
 
 
 class TestResumption(TriageCase):
@@ -147,7 +176,9 @@ class TestResumption(TriageCase):
         before = client.task_calls, client.deep_calls
         again = io.StringIO()
         triage.run(self.cfg, depth=1000, stream=again)
-        self.assertIn("already triaged, rejected", again.getvalue())
+        # The verdict stands from the first run; what must not happen is the model
+        # being measured for it a second time.
+        self.assertFalse(self.ledger()["m:1"]["passed"])
         self.assertEqual((client.task_calls, client.deep_calls), before)
 
     def test_redo_measures_again(self):
@@ -155,20 +186,15 @@ class TestResumption(TriageCase):
         self.go(client)
         again = io.StringIO()
         triage.run(self.cfg, depth=1000, redo=True, stream=again)
-        self.assertIn("REJECTED at speed", again.getvalue())
+        self.assertEqual(self.codes(), ["slow_generation"])
 
-    def test_apply_adds_the_rejected_to_the_discard_list(self):
-        from codesift import prune
+    def test_a_rejection_is_recorded_for_the_report(self):
         client = FakeClient(gen=1.0)
-        self.go(client, apply=True)
-        self.assertEqual(prune.read_discarded(self.tmp), ["m:1"])
-
-    def test_without_apply_nothing_is_discarded(self):
-        from codesift import prune
-        client = FakeClient(gen=1.0)
-        text = self.go(client)
-        self.assertEqual(prune.read_discarded(self.tmp), [])
-        self.assertIn("Pass --apply", text)
+        self.go(client)
+        [rec] = [json.loads(l) for l in
+                 (self.tmp / "triage.jsonl").read_text().splitlines() if l.strip()]
+        self.assertFalse(rec["passed"])
+        self.assertEqual([f["code"] for f in rec["findings"]], ["slow_generation"])
 
 
 class TestLockIsReentrant(unittest.TestCase):
@@ -191,6 +217,41 @@ class TestLockIsReentrant(unittest.TestCase):
         self.assertIsNot(one, two)
 
 
+class TestTheSpeedGateStoresWhatItMeasured(TriageCase):
+    """A model rejected on speed is never probed, so the gate's rate is all there is.
+
+    Kept only inside the finding that phrases the rejection, the report is left
+    making a claim about a model whose figure it cannot show beside any other.
+    """
+
+    def records(self):
+        path = self.tmp / "probe.jsonl"
+        return [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines()
+                if l.strip()]
+
+    def test_the_rate_reaches_the_probe_ledger(self):
+        ok, found, _ = triage.gate_speed(self.cfg, FakeClient(gen=9.0), "slow:1")
+        self.assertFalse(ok)
+        rec = self.records()
+        self.assertEqual([r["model"] for r in rec], ["slow:1"])
+        self.assertEqual(rec[0]["gen_tok_s"], 9.0)
+        self.assertEqual([f["code"] for f in found], ["slow_generation"])
+
+    def test_it_is_not_taken_for_a_deep_measurement(self):
+        from codesift import probe
+        triage.gate_speed(self.cfg, FakeClient(gen=9.0), "slow:1")
+        self.assertFalse(probe.at_depth(self.records()[0]),
+                         "no deep prompt was ever sent")
+        self.assertIsNone(probe.stored(self.cfg, "slow:1", self.cfg.ctx))
+
+    def test_a_model_that_clears_is_recorded_too(self):
+        # The rate is a measurement whatever the verdict, and the probe stage
+        # replaces this record with its own when it measures at depth.
+        ok, _, _ = triage.gate_speed(self.cfg, FakeClient(gen=60.0), "fast:1")
+        self.assertTrue(ok)
+        self.assertEqual(self.records()[0]["gen_tok_s"], 60.0)
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -203,26 +264,23 @@ class TestTheAnswerBookIsComplete(unittest.TestCase):
     """
 
     def test_a_perfect_answer_exists_for_every_task(self):
-        for name in ("basic", "hard"):
-            for task in TASKSETS[name]:
-                with self.subTest(task=task["id"]):
-                    self.assertIn(task["prompt"], ANSWERS)
+        for task in TASKS:
+            with self.subTest(task=task["id"]):
+                self.assertIn(task["prompt"], ANSWERS)
 
     def test_the_perfect_answers_actually_pass_the_real_grader(self):
-        for name in ("basic", "hard"):
-            for task in TASKSETS[name]:
-                with self.subTest(task=task["id"]):
-                    passed, _, detail, _ = screen.grade(
-                        task, {"message": ANSWERS[task["prompt"]]})
-                    self.assertTrue(passed, f"{task['id']}: {detail}")
+        for task in TASKS:
+            with self.subTest(task=task["id"]):
+                passed, _, detail, _ = screen.grade(
+                    task, {"message": ANSWERS[task["prompt"]]})
+                self.assertTrue(passed, f"{task['id']}: {detail}")
 
 
 class TestNoDuplicatedWork(TriageCase):
     """Triage and the screen must not ask a model the same question twice.
 
-    The quality gate grades the whole hard set, which is exactly what the screen
-    is about to do. Measuring it twice costs the model's slowest task set over
-    again for no further information.
+    The tools gate grades tasks the screen is about to grade, so what it measures
+    is recorded where the screen will find it rather than measured again.
     """
 
     def ledger(self):
@@ -233,8 +291,7 @@ class TestNoDuplicatedWork(TriageCase):
         self.go(FakeClient())
         recorded = self.ledger()
         self.assertTrue(recorded, "triage recorded nothing the screen could reuse")
-        sets = {r["taskset"] for r in recorded}
-        self.assertEqual(sets, {"basic", "hard"})
+        self.assertTrue(recorded, "triage recorded nothing for the screen to reuse")
         self.assertTrue(all(r["run"] == 1 for r in recorded),
                         "recorded as run 1, the run the screen fills first")
 
@@ -245,33 +302,27 @@ class TestNoDuplicatedWork(TriageCase):
 
         with mock.patch.object(screen, "Ollama", lambda *a, **k: client), \
              mock.patch.object(screen.gpulock, "acquire"), \
-             mock.patch("sys.stdout", new=io.StringIO()) as out:
-            screen.run(self.cfg, taskset="hard", runs=1)
-        self.assertEqual(client.task_calls, graded_by_triage,
-                         "the screen re-ran tasks triage had already graded")
-        self.assertIn("complete", out.getvalue())
+             mock.patch("sys.stdout", new=io.StringIO()):
+            screen.run(self.cfg)
+        self.assertLess(client.task_calls - graded_by_triage, len(TASKS),
+                        "the screen re-ran tasks triage had already graded")
 
-    def test_the_screen_still_writes_a_summary_for_a_set_triage_completed(self):
-        # Triage records tasks without a summary. Without this the hard set would
-        # be missing from the report despite having been measured in full.
+    def test_the_screen_completes_the_set_triage_started(self):
+        # Triage grades the tool tasks into the screen's own ledger; the screen
+        # measures the rest and every task ends up on record exactly once.
         client = FakeClient()
         self.go(client)
         with mock.patch.object(screen, "Ollama", lambda *a, **k: client), \
              mock.patch.object(screen.gpulock, "acquire"), \
              mock.patch("sys.stdout", new=io.StringIO()):
-            screen.run(self.cfg, taskset="hard", runs=1)
-        rows = [json.loads(l) for l in
-                (self.tmp / "screen.jsonl").read_text().splitlines() if l.strip()]
-        hard = [r for r in rows if r["taskset"] == "hard"]
-        self.assertEqual(len(hard), 1)
-        self.assertEqual(hard[0]["n"], len(TASKSETS["hard"]))
-        graded = [r for r in self.ledger() if r["taskset"] == "hard"]
-        expected = round(100 * sum(1 for r in graded if r["passed"]) / len(graded), 1)
-        self.assertEqual(hard[0]["pass_rate"], expected,
-                         "the summary must agree with the records triage wrote")
+            screen.run(self.cfg)
+        graded = self.ledger()
+        self.assertEqual(len(graded), len(TASKS))
+        self.assertEqual(len({r["task"] for r in graded}), len(TASKS))
 
     def test_a_rejected_model_leaves_behind_what_it_did_answer(self):
         # The cheap gates ran; their results are measurements and should survive.
-        self.go(FakeClient(hard_pass=False))
-        sets = {r["taskset"] for r in self.ledger()}
-        self.assertIn("basic", sets, "the tool-call results were thrown away")
+        self.go(FakeClient(answers_well=False))
+        graded = {r["task"] for r in self.ledger()}
+        self.assertTrue(graded & {t["id"] for t in TASKS if t["kind"] == "toolcall"},
+                        "the tool-call results were thrown away")

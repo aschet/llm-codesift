@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Thomas Ascher <thomas.ascher@gmx.at>
+#
+# SPDX-License-Identifier: MIT
 """Mutual exclusion for anything that loads a model.
 
 Two jobs sharing one GPU thrash and silently corrupt each other's timings, so
@@ -14,6 +17,8 @@ import os
 import sys
 import tempfile
 import time
+
+from . import progress
 
 _handle = None      # module level, so the lock lives as long as the process
 
@@ -70,11 +75,11 @@ def acquire(label: str = "", *, endpoint: str = "", wait: bool = True,
                   file=sys.stderr)
             raise SystemExit(3)
         if not announced:
-            print("waiting for the GPU lock held by another codesift job...", flush=True)
+            progress.note("waiting for the GPU lock held by another codesift job")
             announced = True
         time.sleep(poll)
     if announced:
-        print(f"lock acquired after {time.time() - started:.0f}s", flush=True)
+        progress.note(f"lock acquired after {time.time() - started:.0f}s")
     try:
         with open(path + ".owner", "w", encoding="utf-8") as fh:
             fh.write(f"{os.getpid()} {label}\n")

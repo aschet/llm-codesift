@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Thomas Ascher <thomas.ascher@gmx.at>
+#
+# SPDX-License-Identifier: MIT
 """Prompt-level screening: generation, editing, output format, tool calls, tracing.
 
 Results are appended per task, so an interrupted run resumes without regenerating
@@ -14,23 +17,25 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import gpulock
+from . import gpulock, ledger, progress
+from . import args
 from .config import Config
 from .ollama import Ollama
-from .tasks import TASKSETS
+from .tasks import TASKS
 
 EXEC_TIMEOUT = 15
 
-# The budget has to cover a model's reasoning as well as its answer, and it exists to
-# stop a runaway rather than to constrain a legitimate reply. At 2048 it was binding on
-# the longest tasks: a reasoning model spent it thinking and returned no code at all,
-# which the grader recorded as incompetence. Set high enough that reaching it is itself
-# a finding, and reported as such rather than silently scored as a wrong answer.
+# The budget covers a model's reasoning as well as its answer, and exists to stop a
+# runaway rather than to constrain a legitimate reply. It is roughly 2.5 times the
+# longest passing reply measured: too low silently converts a verbose model into an
+# incompetent one, while too high only costs time, under two minutes a task.
+#
+# The figure to watch is not this one but how often it is reached. Past a few percent
+# the budget has started deciding scores, and the report names every model it bound.
 NUM_PREDICT = 6144
 
-# How much of each reply is kept. A grading bug in how code was pulled out of a reply
-# could only be confirmed on the replies short enough to have survived this cap, and
-# most of the ones in question had not; the record is worth the disk.
+# How much of each reply is kept, so that a changed grader can be applied to it
+# without asking the model again.
 RAW_KEPT = 12000
 
 
@@ -39,15 +44,14 @@ def _declarations_only(code: str) -> str:
 
     A bare expression at the top level -- `print(divide(10, 0))`, `flaky_call()` --
     is a demonstration. It is not part of the answer, and running it alongside the
-    tests grades the model on its illustration: one reply divided by zero on purpose
-    to show the retry working, and another called a function that fails at random,
-    which would have made the result differ between runs of identical input.
+    tests grades the model on its illustration; one that fails at random would also
+    make the result differ between runs of identical input.
 
     Everything that declares something is kept, in order, so imports introduced
     beside a first attempt remain available to the version that supersedes it, and
     a redefinition later in the reply wins exactly as Python would have it. Code
     that will not parse is returned untouched, since the grader is about to run it
-    and report the syntax error, which is the honest result.
+    and report the syntax error.
     """
     try:
         tree = ast.parse(code)
@@ -75,12 +79,9 @@ def extract_code(text: str, entry: str | None = None) -> str:
     """Pull the answer out of a reply, tolerating fences and surrounding prose.
 
     A reply usually holds several fenced blocks, and which one is the answer is not
-    a question of size. Taking the longest graded whichever happened to be longer,
-    so a model that documented a correct answer with a few example calls was scored
-    on the examples and failed for a NameError -- a penalty for explaining an
-    answer, recorded as incorrectness. Taking the first block that defines the entry
-    point graded a draft the model had already withdrawn, since a model reasoning
-    through a bug shows the broken version before the fixed one.
+    a question of size or of position: a model reasoning through a bug shows the
+    broken version before the fixed one, and one that documents a correct answer
+    shows example calls after it.
 
     So the whole reply is the answer: every fenced block, joined in order, with
     demonstrations removed by `_declarations_only`. Later definitions supersede
@@ -148,9 +149,8 @@ def run_checks(code: str, tests: str) -> tuple[int, int, str]:
     """Return (checks met, checks total, what the first shortfall was).
 
     A task's assertions are graded one at a time rather than as a single script.
-    Most failing answers are near misses -- across one full sweep the median
-    satisfied three quarters of the assertions it was given -- and scoring those
-    the same as code that does not run reports a difference that is not there.
+    Most failing answers are near misses, and scoring those the same as code that
+    does not run reports a difference that is not there.
 
     The statements run in order in one namespace, because a task's checks are not
     independent: some build the object the later ones examine. A setup statement
@@ -299,19 +299,50 @@ def grade(task: dict, response: dict) -> tuple[bool, bool, str, float]:
     return False, False, f"unknown task kind {kind!r}", 0.0
 
 
+def run_turns(client, model: str, task: dict, *, ctx: int,
+              num_predict: int) -> tuple[dict, int]:
+    """Put a task to the model, answering the calls it makes on the way.
+
+    One turn unless the task offers more. Where it does, a call to a tool other
+    than the one the task asks for is answered from `results` and the model is
+    asked again: a model that lists the test files before running them has not
+    called the wrong tool, and a harness would have served that call.
+
+    Returns the last reply and how many turns it took, with the wall time of all
+    of them, since the whole exchange is what a session would have paid.
+    """
+    prompt = task["prompt"]
+    if task["kind"] == "edit":
+        prompt = f"{prompt}\n\n```python\n{task['code']}\n```"
+    messages = [{"role": "user", "content": prompt}]
+    budget, wall = task.get("turns", 1), 0.0
+    for turn in range(1, budget + 1):
+        resp = client.chat(model, messages if turn > 1 else prompt, ctx=ctx,
+                           num_predict=num_predict, tools=task.get("tools"))
+        wall += resp.get("_wall") or 0.0
+        resp["_wall"] = round(wall, 2)
+        message = resp.get("message") or {}
+        calls = message.get("tool_calls") or []
+        name = (calls[0].get("function") or {}).get("name") if calls else None
+        served = (task.get("results") or {}).get(name)
+        if turn == budget or name is None or name == task.get("want") or served is None:
+            return resp, turn
+        messages = messages + [message, {"role": "tool", "tool_name": name,
+                                         "content": json.dumps(served)}]
+    return resp, budget
+
+
+def key(rec: dict) -> tuple:
+    """What makes a result the same result: one model, one run, one task."""
+    return rec["model"], rec["run"], rec["task"]
+
+
 def load_ledger(path: Path) -> dict:
-    done = {}
-    if path.exists():
-        for line in path.read_text(encoding="utf-8").splitlines():
-            try:
-                rec = json.loads(line)
-                done[(rec["model"], rec["run"], rec["taskset"], rec["task"])] = rec
-            except Exception:
-                pass
-    return done
+    """Every task result on file, by model, run and task."""
+    return ledger.keyed(path, key)
 
 
-def measure_tasks(client, cfg: Config, model: str, taskset: str, run_idx: int,
+def measure_tasks(client, cfg: Config, model: str, run_idx: int,
                   tasks: list[dict], done: dict, ledger_path: Path,
                   num_predict: int = NUM_PREDICT) -> list[dict]:
     """Run these tasks for one model and append each result to the ledger.
@@ -325,28 +356,30 @@ def measure_tasks(client, cfg: Config, model: str, taskset: str, run_idx: int,
     """
     records = []
     for task in tasks:
-        key = (model, run_idx, taskset, task["id"])
-        if key in done:
-            records.append(done[key])
+        ident = (model, run_idx, task["id"])
+        if ident in done:
+            records.append(done[ident])
             continue
-        prompt = task["prompt"]
-        if task["kind"] == "edit":
-            prompt = f"{prompt}\n\n```python\n{task['code']}\n```"
         try:
-            resp = client.chat(model, prompt, ctx=cfg.ctx, num_predict=num_predict,
-                               tools=task.get("tools"))
+            resp, turns = run_turns(client, model, task, ctx=cfg.ctx,
+                                    num_predict=num_predict)
         except Exception as exc:
-            rec = dict(model=model, run=run_idx, taskset=taskset,
+            rec = dict(model=model, run=run_idx, ctx=cfg.ctx,
                        task=task["id"], kind=task["kind"], passed=False, score=0.0,
                        format_ok=False, detail=f"{type(exc).__name__}: {exc}",
                        wall=None, ts=time.time())
         else:
             passed, parseable, detail, score = grade(task, resp)
+            if turns > 1:
+                # It reached the right tool, so it is not the wrong tool -- but it
+                # took another round trip to get there, and the score is what one
+                # direct call would have earned spread over the turns it took.
+                score /= turns
+                detail = f"{detail}, in {turns} turns"
             rec = dict(
-                model=model, run=run_idx, taskset=taskset, ts=time.time(),
+                model=model, run=run_idx, ts=time.time(), ctx=cfg.ctx, turns=turns,
                 task=task["id"], kind=task["kind"], passed=passed, score=score,
                 format_ok=parseable, detail=detail, wall=resp["_wall"],
-                gen_toks=resp.get("eval_count"),
                 gen_tok_s=round(resp["eval_count"] / (resp["eval_duration"] / 1e9), 1)
                 if resp.get("eval_count") and resp.get("eval_duration") else None,
                 hit_cap=bool(resp.get("eval_count")
@@ -355,41 +388,62 @@ def measure_tasks(client, cfg: Config, model: str, taskset: str, run_idx: int,
                 tool_calls=(resp.get("message") or {}).get("tool_calls"),
             )
         records.append(rec)
-        done[key] = rec
-        with ledger_path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(rec) + "\n")
-        print(f"  {task['id']:16} {'PASS' if rec['passed'] else 'FAIL':4} "
-              f"{rec['wall'] or 0:6.1f}s  {rec['detail'][:60]}", flush=True)
+        done[ident] = rec
+        # Replace, do not append: the report reads this ledger directly, so a
+        # superseded record would be counted twice. Written against what is on
+        # disk rather than against `done`, which --redo empties.
+        ledger.replace(ledger_path, rec, key)
+        # A test point is all-or-nothing and a code task is not, so the share of
+        # assertions met rides along in the diagnostics.
+        progress.unit("screen", task["id"],
+                      progress.OK if rec["passed"] else progress.FAIL,
+                      rec["wall"] or 0.0, rec["detail"][:60],
+                      score=rec.get("score"))
     return records
 
 
-def run(cfg: Config, taskset: str = "basic", runs: int = 1, num_predict: int = NUM_PREDICT, redo: bool = False,
+# Every task is measured once. Greedy decoding at a fixed seed reproduces exactly for
+# all but one of the models measured, so a second run re-measures a function that has
+# already answered; it is also what the code benchmarks do, ranking on greedy pass@1
+# from a single sample.
+#
+# The uncertainty that remains is in the task sample, not in the decoding: at 29 tasks
+# and a rate near 85% the 95% interval is about 13 points, and repeating the same tasks
+# does not narrow it. Only more tasks do.
+RUN = 1
+
+
+def run(cfg: Config, num_predict: int = NUM_PREDICT, redo: bool = False,
         only: list[str] | None = None) -> None:
-    gpulock.acquire(f"screen {taskset}", endpoint=cfg.host)
+    gpulock.acquire("screen", endpoint=cfg.host)
     client = Ollama(cfg.host, cfg.timeout)
-    tasks = TASKSETS[taskset]
+    tasks = TASKS
     ledger_path = cfg.path("screen_tasks.jsonl")
-    summary_path = cfg.path("screen.jsonl")
-    done = {} if redo else load_ledger(ledger_path)
+    stored = load_ledger(ledger_path)
+    done = {} if redo else dict(stored)
+    unknown = sorted(set(only or []) - {t["id"] for t in tasks})
+    if unknown:
+        # A typo would otherwise report success having measured nothing.
+        raise SystemExit(f"unknown task id(s): {', '.join(unknown)}")
     selected = [t for t in tasks if not only or t["id"] in set(only)]
 
-    for run_idx in range(1, runs + 1):
-        for model in cfg.resolve_models():
-            pending = [t for t in selected
-                       if (model, run_idx, taskset, t["id"]) not in done]
-            if pending:
-                print(f"\n{model} [{taskset} run {run_idx}]: {len(pending)} task(s) to run",
-                      flush=True)
-            else:
-                # Nothing left to measure, but the summary may never have been
-                # written: triage records task results without one, so a set it
-                # completed would otherwise be missing from the report entirely.
-                print(f"{model} [{taskset} run {run_idx}]: complete", flush=True)
-            records = measure_tasks(client, cfg, model, taskset, run_idx, selected,
-                                    done, ledger_path, num_predict)
-            _write_summary(summary_path, model, run_idx, taskset, cfg.ctx, records)
-            if pending:
-                client.unload(model)
+    models = cfg.resolve_models()
+    for i, model in enumerate(models, 1):
+        pending = [t for t in selected
+                   if (model, RUN, t["id"]) not in done]
+        if pending:
+            progress.subject(i, len(models), model, f"{len(pending)} task(s) to run")
+        else:
+            progress.subject(i, len(models), model)
+        measure_tasks(client, cfg, model, RUN, selected, done, ledger_path,
+                      num_predict)
+        # Everything on record for this model, not whatever this invocation
+        # selected, and a fresh measurement supersedes a stored one of the same task.
+        held = {**stored, **done}
+        _report(model, [held[(model, RUN, t["id"])] for t in tasks
+                        if (model, RUN, t["id"]) in held])
+        if pending:
+            client.unload(model)
 
 
 def _score(rec: dict) -> float:
@@ -397,45 +451,33 @@ def _score(rec: dict) -> float:
     return float(got) if got is not None else float(bool(rec.get("passed")))
 
 
-def _write_summary(path: Path, model: str, run_idx: int, taskset: str, ctx: int,
-                   records: list[dict]) -> None:
-    """Rewrite this model's row for this run and task set.
-
-    `total_s` is the sum of the tasks' own times rather than the wall clock of the
-    process, so a set finished across two sessions reports the same figure as one
-    finished in a single sitting.
-    """
+def _report(model: str, records: list[dict]) -> None:
+    """Say how the model did, from the records themselves."""
     n = len(records) or 1
-    walls = sorted(r["wall"] for r in records if r.get("wall"))
-    summary = dict(
-        model=model, run=run_idx, taskset=taskset, ctx=ctx, ts=time.time(),
-        n=len(records),
-        passed=sum(1 for r in records if r["passed"]),
-        # The mean of what each task scored, not the count of tasks fully met. A
-        # record written before scores existed has none, so its outcome stands in.
-        pass_rate=round(100 * sum(_score(r) for r in records) / n, 1),
-        fully_passed_rate=round(100 * sum(1 for r in records if r["passed"]) / n, 1),
-        format_ok_rate=round(100 * sum(1 for r in records if r["format_ok"]) / n, 1),
-        hit_cap_n=sum(1 for r in records if r.get("hit_cap")),
-        median_wall=walls[len(walls) // 2] if walls else None,
-        total_s=round(sum(r.get("wall") or 0 for r in records), 1),
-        tasks=records,
-    )
-    rows = []
-    if path.exists():
-        for line in path.read_text(encoding="utf-8").splitlines():
-            try:
-                rec = json.loads(line)
-                if not (rec.get("model") == model and rec.get("run") == run_idx
-                        and rec.get("taskset") == taskset):
-                    rows.append(rec)
-            except Exception:
-                pass
-    rows.append(summary)
-    with path.open("w", encoding="utf-8") as fh:
-        for rec in rows:
-            fh.write(json.dumps(rec) + "\n")
-    print(f"  -> {summary['passed']}/{summary['n']} passed ({summary['pass_rate']}%), "
-          f"parseable {summary['format_ok_rate']}%, {summary['total_s']}s"
-          + (f"  [WARNING: {summary['hit_cap_n']} replies hit the token cap]"
-             if summary["hit_cap_n"] else ""), flush=True)
+    passed = sum(1 for r in records if r["passed"])
+    rate = round(100 * sum(_score(r) for r in records) / n, 1)
+    parseable = round(100 * sum(1 for r in records if r["format_ok"]) / n, 1)
+    capped = sum(1 for r in records if r.get("hit_cap"))
+    # The count and the rate measure different things -- tasks fully met, against
+    # the mean score with partial credit per assertion -- so the line says which is
+    # which rather than printing them as one figure and its percentage.
+    progress.result(f"scored {rate}%, {passed} of {len(records)} tasks fully passed, "
+                    f"parseable {parseable}%"
+                    + (f", WARNING: {capped} replies hit the token cap" if capped else ""))
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = args.stage("screen", "Prompt-level tasks: code, edit, format, tools, tracing.",
+                        executes=True)
+    parser.add_argument("--num-predict", type=int, default=NUM_PREDICT, metavar="TOKENS",
+                        help="output budget per reply (default: %(default)s)")
+    parser.add_argument("--only", nargs="+", metavar="TASK_ID")
+    parser.add_argument("--redo", action="store_true")
+    a = parser.parse_args(argv)
+    with progress.document():
+        run(args.config_from(a), num_predict=a.num_predict, redo=a.redo, only=a.only)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

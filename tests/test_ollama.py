@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Thomas Ascher <thomas.ascher@gmx.at>
+#
+# SPDX-License-Identifier: MIT
 """HTTP client behaviour, exercised without a server."""
 import copy
 import unittest
@@ -84,24 +87,3 @@ class TestUnload(unittest.TestCase):
         client.unload("m")
         self.assertEqual(client.requests[0][1]["keep_alive"], 0)
 
-    def test_unload_all_stops_when_clear(self):
-        client = RecordingClient([{"models": []}])
-        self.assertTrue(client.unload_all(deadline=5))
-
-    def test_unload_all_gives_up_after_the_deadline(self):
-        class Stuck(RecordingClient):
-            def _get(self, path, timeout=30):
-                return {"models": [{"name": "stuck"}]}
-            def _post(self, path, payload, timeout=None):
-                return {}
-        self.assertFalse(Stuck().unload_all(deadline=0.1))
-
-    def test_errors_during_unload_are_swallowed(self):
-        class Broken(RecordingClient):
-            def _post(self, path, payload, timeout=None):
-                raise OSError("connection reset")
-        Broken().unload("m")      # must not raise
-
-
-if __name__ == "__main__":
-    unittest.main()

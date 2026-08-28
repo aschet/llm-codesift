@@ -1,12 +1,15 @@
+# SPDX-FileCopyrightText: 2026 Thomas Ascher <thomas.ascher@gmx.at>
+#
+# SPDX-License-Identifier: MIT
 """Interrupted runs must continue, not restart and not silently skip work."""
-import io
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from codesift import agent, prefixcache, probe, screen
+from codesift import probe, progress, screen
 from codesift.config import Config
 
 
@@ -23,11 +26,6 @@ class FakeClient:
                 "eval_count": 5, "eval_duration": 100_000_000,
                 "prompt_eval_count": 40000, "prompt_eval_duration": 1_000_000_000}
 
-    def chat_messages(self, model, messages, **kwargs):
-        self.calls.append(model)
-        return {"message": {"content": "1"}, "_wall": 0.1,
-                "prompt_eval_count": 100, "prompt_eval_duration": 500_000_000}
-
     def placement(self, model):
         return {"pct_gpu": 50.0, "total_gb": 10.0, "vram_gb": 5.0}
 
@@ -37,6 +35,7 @@ class FakeClient:
 
 class ResumeCase(unittest.TestCase):
     def setUp(self):
+        progress.reset()
         self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.cfg = Config(results_dir=self.tmp, models=["m:1"], ctx=4096)
         self.enterContext(mock.patch.object(screen.gpulock, "acquire"))
@@ -76,20 +75,13 @@ class TestScreenResume(ResumeCase):
         self.run_screen(redo=True)
         self.assertEqual(self.total_calls, 4)
 
-    def test_separate_runs_are_independent(self):
-        self.run_screen()
-        with mock.patch.object(screen, "Ollama", self.client_factory):
-            screen.run(self.cfg, only=["fmt_oneword", "tc_single"], runs=2)
-        # run 1 is cached; run 2 is new, so two further calls
-        self.assertEqual(self.total_calls, 4)
-
-    def test_summary_is_rewritten_not_duplicated(self):
+    def test_a_task_is_stored_once_however_often_it_is_measured(self):
         self.run_screen()
         self.run_screen(redo=True)
         rows = [json.loads(l) for l in
-                (self.tmp / "screen.jsonl").read_text(encoding="utf-8").splitlines()]
-        keys = [(r["model"], r["run"], r["taskset"]) for r in rows]
-        self.assertEqual(len(keys), len(set(keys)), "duplicate summary rows")
+                (self.tmp / "screen_tasks.jsonl").read_text(encoding="utf-8").splitlines()]
+        keys = [(r["model"], r["run"], r["task"]) for r in rows]
+        self.assertEqual(len(keys), len(set(keys)), "duplicate task records")
 
     def test_ledger_survives_a_partial_write(self):
         self.run_screen()
@@ -109,6 +101,16 @@ class TestProbeResume(ResumeCase):
             probe.run(self.cfg, depth=100)
         self.assertEqual(self.total_calls, first)
 
+    def test_redo_measures_again_rather_than_reading_back(self):
+        """--redo exists to replace a record, so it must not be answered by one."""
+        from codesift import probe
+        probe.record(self.cfg, dict(model="m:1", num_ctx=self.cfg.ctx, prefill_s=4.0,
+                                    depth_target=100, gen_tok_s=50.0, retrieved=True))
+        with mock.patch.object(probe, "Ollama", self.client_factory), \
+             mock.patch.object(probe.gpulock, "acquire"):
+            probe.run(self.cfg, depth=100, redo=True)
+        self.assertGreater(self.total_calls, 0, "the stored record answered instead")
+
     def test_failed_measurements_are_retried(self):
         """A record carrying an error must not count as done."""
         (self.tmp / "probe.jsonl").write_text(
@@ -120,197 +122,177 @@ class TestProbeResume(ResumeCase):
         self.assertGreater(self.total_calls, 0, "an errored model should be retried")
 
 
-class TestPrefixCacheResume(ResumeCase):
-    def test_skips_measured_models(self):
-        with mock.patch.object(prefixcache, "Ollama", self.client_factory), \
-             mock.patch.object(prefixcache.gpulock, "acquire"):
-            prefixcache.run(self.cfg)
-            first = self.total_calls
-            prefixcache.run(self.cfg)
-        self.assertEqual(self.total_calls, first)
+class TestTheDepthIsMeasuredNotAssumed(unittest.TestCase):
+    """The prompt is sized by the model's own tokenizer, and the server is asked.
+
+    A fixed characters-per-token figure sizes the prompt wrong by up to a third,
+    and the error runs the wrong way: a prompt built for three quarters of the
+    window arrives at the whole of it, and the overflow is discarded in silence.
+    """
+
+    class Counter:
+        """Reports a token count derived from a fixed characters-per-token rate."""
+
+        def __init__(self, chars_per_token=2.5, overhead=7, cap=None):
+            self.rate, self.overhead, self.cap = chars_per_token, overhead, cap
+            self.lengths, self.prompts = [], []
+
+        def chat(self, model, prompt, **kwargs):
+            self.lengths.append(len(prompt))
+            self.prompts.append(prompt)
+            n = self.overhead + int(len(prompt) / self.rate)
+            return {"message": {"content": "quartz-mongoose-8814"}, "_wall": 0.1,
+                    "eval_count": 4, "eval_duration": 10 ** 8,
+                    "prompt_eval_count": min(n, self.cap) if self.cap else n,
+                    "prompt_eval_duration": 10 ** 9}
+
+        def placement(self, model):
+            return {"pct_gpu": 100.0, "total_gb": 4.0}
+
+    def test_the_ratio_comes_from_the_server(self):
+        client = self.Counter(chars_per_token=2.5)
+        self.assertAlmostEqual(probe.calibrate(client, "m:1", 4096, 24576), 2.5,
+                               places=1)
+
+    def test_the_ratio_is_measured_on_the_text_that_will_be_sent(self):
+        # The block index grows through the filler and handler_7 does not
+        # tokenize like handler_431, so the sample has to come from where the
+        # prompt actually is, not from its first few blocks.
+        client = self.Counter()
+        probe.calibrate(client, "m:1", 4096, 24576)
+        sample = client.prompts[-1]
+        whole = probe._filler(24576, probe.DEFAULT_CHARS_PER_TOKEN)
+        self.assertIn(sample, whole, "the sample is a slice of the real prompt")
+        self.assertLessEqual(len(sample), probe.CALIBRATION_CHARS)
+        indices = [int(n) for n in re.findall(r"def handler_(\d+)", sample)]
+        highest = whole.count("def handler_") - 1
+        self.assertGreater(min(indices), highest // 4,
+                           "a slice from the start prices numbers that are shorter")
+
+    def test_the_prompt_is_sized_to_the_measured_ratio(self):
+        # The one that matters: at 2.5 chars/token a prompt built at 3.5 would be
+        # 40% over, which is what pushed a model past its window.
+        client = self.Counter(chars_per_token=2.5)
+        rec = probe.measure(client, "m:1", 32768, 24576)
+        self.assertAlmostEqual(rec["depth_tokens"] / 24576, 1.0, delta=0.1)
+        self.assertFalse(rec["likely_truncated"])
+
+    def test_a_prompt_the_window_could_not_hold_is_seen(self):
+        # The server reports what it read, so a cut prompt is a number, not a guess.
+        client = self.Counter(chars_per_token=2.5, cap=16384)
+        rec = probe.measure(client, "m:1", 32768, 24576)
+        self.assertEqual(rec["depth_tokens"], 16384)
+        self.assertTrue(rec["likely_truncated"])
+
+    def test_an_unreadable_count_falls_back_to_the_shorter_prompt(self):
+        class Mute(self.Counter):
+            def chat(self, model, prompt, **kwargs):
+                out = super().chat(model, prompt, **kwargs)
+                out["prompt_eval_count"] = None
+                return out
+
+        self.assertEqual(probe.calibrate(Mute(), "m:1", 4096, 24576),
+                         probe.DEFAULT_CHARS_PER_TOKEN)
 
 
-class TestAgentResume(ResumeCase):
-    """The agent stage was the one stage without resumption coverage.
+class TestTheDeepPromptIsPaidOnce(ResumeCase):
+    """Triage and the probe stage take the same measurement.
 
-    It is also the stage where an interruption costs most: the application task
-    allows an hour per model, so repeating finished work on a resume can waste a
-    day.
+    The deep prompt costs a minute on a large model, so whichever of them runs
+    first writes it to the probe ledger and the other reads it. Only a record
+    taken at depth counts: the speed gate writes one too, and it holds a rate.
     """
 
     def setUp(self):
+        progress.reset()
         super().setUp()
-        self.cfg.models = ["m:1", "m:2"]
-        self.enterContext(mock.patch.object(agent.gpulock, "acquire"))
-        self.enterContext(mock.patch.object(agent, "preflight", lambda models: None))
-        self.enterContext(mock.patch.object(agent, "Ollama", self.client_factory))
-        self.attempted = []
-
-        def fake_task(model, task, workdir, timeout, retain_dir=None):
-            self.attempted.append((model, task["id"]))
-            return dict(model=model, task=task["id"], passed=False, detail="no",
-                        wall_s=1.0, timed_out=False, returncode=0, tool_calls=0,
-                        tools=[], turns=0, errors=[], tokens={}, peak_input_tokens=0,
-                        repo=str(self.tmp / "r"), stderr="", ts=0.0, checks=[],
-                        score=None, screenshot=None, retained=False)
-
-        self.enterContext(mock.patch.object(agent, "run_task", fake_task))
-
-    def run_agent(self, **kwargs):
-        with mock.patch("sys.stdout", new=io.StringIO()) as out:
-            agent.run(self.cfg, only=["ag_fixbug"], **kwargs)
-        return out.getvalue()
-
-    def test_a_second_run_attempts_nothing_again(self):
-        self.run_agent()
-        self.assertEqual(self.attempted, [("m:1", "ag_fixbug"), ("m:2", "ag_fixbug")])
-        text = self.run_agent()
-        self.assertEqual(len(self.attempted), 2, "recorded work was attempted again")
-        self.assertIn("already measured, skipping", text)
-
-    def test_only_the_unmeasured_model_is_attempted(self):
         self.cfg.models = ["m:1"]
-        self.run_agent()
-        self.cfg.models = ["m:1", "m:2"]
-        self.run_agent()
-        self.assertEqual(self.attempted,
-                         [("m:1", "ag_fixbug"), ("m:2", "ag_fixbug")])
 
-    def test_redo_attempts_everything_again(self):
-        self.run_agent()
-        self.run_agent(redo=True)
-        self.assertEqual(len(self.attempted), 4)
+    def test_a_stored_measurement_is_found(self):
+        from codesift import probe
+        probe.record(self.cfg, dict(model="m:1", num_ctx=self.cfg.ctx, prefill_s=4.0,
+                                    depth_target=24576, gen_tok_s=50.0, retrieved=True))
+        self.assertIsNotNone(probe.stored(self.cfg, "m:1", self.cfg.ctx))
 
-    def test_the_model_is_released_after_its_last_task(self):
-        # Every other stage unloads between models. Leaving one resident means the
-        # next loads alongside it, and two 35B models do not fit.
-        self.run_agent()
-        unloaded = [m for c in self.clients for m in getattr(c, "unloaded", [])]
-        self.assertEqual(unloaded, ["m:1", "m:2"])
+    def test_a_shallow_record_is_not_mistaken_for_a_measurement(self):
+        # The speed gate stops before the deep prompt and stores what it did
+        # measure; treating that as complete would skip the deep measurement.
+        from codesift import probe
+        probe.record(self.cfg, dict(model="m:1", num_ctx=self.cfg.ctx, gen_tok_s=50.0,
+                                    depth_target=0))
+        self.assertIsNone(probe.stored(self.cfg, "m:1", self.cfg.ctx))
+        self.assertFalse(probe.at_depth(dict(model="m:1", gen_tok_s=50.0)))
 
-    def test_a_damaged_ledger_line_does_not_force_the_whole_stage_again(self):
-        self.run_agent()
-        with (self.tmp / "agentic.jsonl").open("a", encoding="utf-8") as fh:
-            fh.write('{"model": "m:1", "ta')          # cut off mid-write
-        self.run_agent()
-        self.assertEqual(len(self.attempted), 2)
+    def test_a_measurement_at_another_window_does_not_count(self):
+        from codesift import probe
+        probe.record(self.cfg, dict(model="m:1", num_ctx=8192, prefill_s=4.0,
+                                    depth_target=6144))
+        self.assertIsNone(probe.stored(self.cfg, "m:1", self.cfg.ctx))
 
+    def test_a_second_write_replaces_the_first(self):
+        # Triage writes what the speed gate measured, then the deep measurement
+        # supersedes it. One model at one window is one record.
+        from codesift import probe
+        probe.record(self.cfg, dict(model="m:1", num_ctx=self.cfg.ctx, gen_tok_s=50.0))
+        probe.record(self.cfg, dict(model="m:1", num_ctx=self.cfg.ctx, prefill_s=4.0,
+                                    depth_target=24576, retrieved=True))
+        rows = [json.loads(l) for l in
+                (self.tmp / "probe.jsonl").read_text().splitlines() if l.strip()]
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]["retrieved"])
 
-class TestAgentBudget(ResumeCase):
-    """An unattended sweep should not discover its own duration by running."""
+    def test_another_model_is_not_disturbed(self):
+        from codesift import probe
+        probe.record(self.cfg, dict(model="keep:1", num_ctx=self.cfg.ctx, prefill_s=1.0))
+        probe.record(self.cfg, dict(model="m:1", num_ctx=self.cfg.ctx, prefill_s=4.0))
+        probe.record(self.cfg, dict(model="m:1", num_ctx=self.cfg.ctx, prefill_s=5.0))
+        rows = [json.loads(l) for l in
+                (self.tmp / "probe.jsonl").read_text().splitlines() if l.strip()]
+        self.assertEqual({r["model"] for r in rows}, {"keep:1", "m:1"})
+        self.assertEqual(len(rows), 2)
 
-    def setUp(self):
-        super().setUp()
-        self.cfg.models = ["m:1", "m:2"]
-        self.enterContext(mock.patch.object(agent.gpulock, "acquire"))
-        self.enterContext(mock.patch.object(agent, "preflight", lambda models: None))
-        self.enterContext(mock.patch.object(agent, "Ollama", self.client_factory))
-        self.enterContext(mock.patch.object(
-            agent, "run_task",
-            lambda model, task, workdir, timeout, retain_dir=None: dict(
-                model=model, task=task["id"], passed=True, detail="ok", wall_s=1.0,
-                timed_out=False, returncode=0, tool_calls=0, tools=[], turns=0,
-                errors=[], tokens={}, peak_input_tokens=0, repo=str(self.tmp / "r"),
-                stderr="", ts=0.0, checks=[], score=None, screenshot=None,
-                retained=False)))
-
-    def budget(self):
-        with mock.patch("sys.stdout", new=io.StringIO()) as out:
-            agent.run(self.cfg, only=["ag_module"], timeout=1200)
-        return out.getvalue()
-
-    def test_the_worst_case_is_stated_before_any_work_begins(self):
-        text = self.budget()
-        self.assertIn("2 task(s) to run", text)
-        self.assertIn("0.7h", text, "two models at the task's own floor, not at "
-                                    "the smaller default passed in")
-
-    def test_work_already_recorded_is_not_counted_into_the_budget(self):
-        self.budget()
-        self.assertIn("0 task(s)", self.budget() + "0 task(s)")
-        self.cfg.models = ["m:1", "m:2", "m:3"]
-        self.assertIn("0.3h", self.budget())
-
-
-class TestAgentSelection(ResumeCase):
-    """Models the screen ruled out must not be given an hour each to prove it.
-
-    The stage used to run every installed model regardless of verdict. With the
-    application task allowing an hour apiece, a sweep spent most of a day on
-    models already known to be unusable.
-    """
-
-    def setUp(self):
-        super().setUp()
-        self.enterContext(mock.patch.object(agent.gpulock, "acquire"))
-        self.enterContext(mock.patch.object(agent, "preflight", lambda models: None))
-        self.enterContext(mock.patch.object(agent, "Ollama", self.client_factory))
-        self.write_screen()
-
-    def write_screen(self):
-        """One model at 100% on the hard set, one at 47%, one at 80%."""
-        def rec(model, taskset, rate):
-            tasks = [dict(task="t1", kind="codegen", passed=rate >= 50,
-                          format_ok=True, detail="ok", wall=1.0),
-                     dict(task="t2", kind="toolcall", passed=True, format_ok=True,
-                          detail="ok", wall=0.5)]
-            return dict(model=model, run=1, taskset=taskset, ctx=65536, n=14,
-                        passed=int(rate / 100 * 14), pass_rate=rate,
-                        format_ok_rate=100.0, hit_cap_n=0, median_wall=1.0,
-                        total_s=10.0, tasks=tasks)
-
-        def probe_rec(model):
-            return dict(model=model, num_ctx=65536, gen_tok_s=45.0,
-                        prefill_tok_s=800.0, prefill_s=60.0, prefill_toks=48000,
-                        likely_truncated=False, retrieved=True,
-                        placement={"pct_gpu": 40.0})
-
-        with (self.tmp / "screen.jsonl").open("w", encoding="utf-8") as fh:
-            for model, rate in (("good", 100.0), ("okay", 80.0), ("bad", 47.0)):
-                for taskset in ("basic", "hard"):
-                    fh.write(json.dumps(rec(model, taskset, rate)) + "\n")
-        with (self.tmp / "probe.jsonl").open("w", encoding="utf-8") as fh:
-            for model in ("good", "okay", "bad"):
-                fh.write(json.dumps(probe_rec(model)) + "\n")
-        self.cfg.models = ["good", "okay", "bad"]
-
-    def test_the_default_skips_what_the_screen_ruled_out(self):
-        picked = agent.select(self.cfg, self.cfg.models, ["suitable", "limited"])
-        self.assertEqual(picked, ["good", "okay"])
-
-    def test_an_empty_verdict_list_leaves_the_choice_to_the_caller(self):
-        self.assertEqual(agent.select(self.cfg, self.cfg.models, []),
-                         ["good", "okay", "bad"])
-
-    def test_the_skipped_models_are_named_rather_than_silently_dropped(self):
-        attempted = []
-
-        def stub(model, task, workdir, timeout, retain_dir=None):
-            attempted.append(model)
-            return dict(model=model, task=task["id"], passed=True, detail="ok",
-                        wall_s=1.0, timed_out=False, returncode=0, tool_calls=0,
-                        tools=[], turns=0, errors=[], tokens={}, peak_input_tokens=0,
-                        repo=str(self.tmp / "r"), stderr="", ts=0.0, checks=[],
-                        score=None, screenshot=None, retained=False)
-
-        with mock.patch.object(agent, "run_task", stub):
-            with mock.patch("sys.stdout", new=io.StringIO()) as out:
-                agent.run(self.cfg, only=["ag_fixbug"], redo=False,
-                          select_verdicts=["suitable"])
-            text = out.getvalue()
-        self.assertEqual(attempted, ["good"], "only the suitable model was run")
-        self.assertIn("skipping 2 model(s) the screen ruled out", text)
-        self.assertIn("okay", text)
-        self.assertIn("bad", text)
-
-    def test_a_field_with_no_screen_results_says_so_instead_of_running(self):
-        (self.tmp / "screen.jsonl").unlink()
-        with mock.patch("sys.stderr", new=io.StringIO()) as err:
-            code = agent.run(self.cfg, only=["ag_fixbug"],
-                             select_verdicts=["suitable", "limited"])
-        self.assertEqual(code, 2)
-        self.assertIn("Screen the models first", err.getvalue())
+    def test_a_failed_measurement_does_not_count(self):
+        from codesift import probe
+        probe.record(self.cfg, dict(model="m:1", num_ctx=self.cfg.ctx, prefill_s=4.0,
+                                    error="deep: timeout"))
+        self.assertIsNone(probe.stored(self.cfg, "m:1", self.cfg.ctx))
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPartialSelection(ResumeCase):
+    """`--only` re-measures one task; it must not rewrite the model's standing.
+
+    Built from the tasks one invocation selected, the summary went from 29 tasks
+    to 2, and the report ranked the model on those 2 -- which is the opposite of
+    what the flag is for, since it exists to make re-measuring one task cheap.
+    """
+
+    def tasks(self):
+        return [json.loads(l) for l in
+                (self.tmp / "screen_tasks.jsonl").read_text().splitlines() if l.strip()]
+
+    def screen_with(self, **kwargs):
+        with mock.patch.object(screen, "Ollama", self.client_factory):
+            screen.run(self.cfg, **kwargs)
+
+    def test_re_measuring_one_task_keeps_the_rest_on_record(self):
+        self.screen_with(only=["fmt_oneword", "tc_single"])
+        before = {t["task"] for t in self.tasks()}
+        self.screen_with(only=["fmt_oneword"], redo=True)
+        self.assertEqual({t["task"] for t in self.tasks()}, before,
+                         "re-measuring one task dropped the others")
+
+    def test_a_re_measured_task_supersedes_the_stored_one(self):
+        self.screen_with(only=["fmt_oneword", "tc_single"])
+        self.screen_with(only=["fmt_oneword"], redo=True)
+        self.assertEqual(len([t for t in self.tasks() if t["task"] == "fmt_oneword"]), 1)
+
+    def test_an_unknown_task_id_is_refused(self):
+        # Silently measuring less than was asked for is the worst answer: the
+        # flag exists to re-measure one task, and a typo would report success
+        # having never run it.
+        with self.assertRaises(SystemExit):
+            self.screen_with(only=["fmt_oneword", "no_such_task"])

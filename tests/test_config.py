@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Thomas Ascher <thomas.ascher@gmx.at>
+#
+# SPDX-License-Identifier: MIT
 """Configuration, model lists, and the GPU lock."""
 import subprocess
 import sys
@@ -8,7 +11,7 @@ import unittest
 from pathlib import Path
 
 from codesift import gpulock
-from codesift.config import Config, parse_kv, read_model_file
+from codesift.config import Config, read_model_file, working_depth
 
 
 class TestConfig(unittest.TestCase):
@@ -49,40 +52,16 @@ class TestModelFile(unittest.TestCase):
                 """), encoding="utf-8")
             self.assertEqual(read_model_file(path), ["qwen3:14b", "granite4:8b"])
 
-
-class TestParseKv(unittest.TestCase):
-    def test_basic_key_value(self):
-        self.assertEqual(parse_kv("a=b"), {"a": "b"})
-
-    def test_multiple_pairs(self):
-        result = parse_kv("x=1\ny=2")
-        self.assertEqual(result, {"x": "1", "y": "2"})
-
-    def test_whitespace_is_stripped(self):
-        self.assertEqual(parse_kv("  a  =  b  "), {"a": "b"})
-
-    def test_value_can_contain_equals(self):
-        self.assertEqual(parse_kv("a=b=c"), {"a": "b=c"})
-
-    def test_blank_lines_ignored(self):
-        result = parse_kv("\n\nc=d\n\n")
-        self.assertEqual(result, {"c": "d"})
-
-    def test_comments_ignored(self):
-        result = parse_kv("# hello\nx=y")
-        self.assertEqual(result, {"x": "y"})
-
-    def test_commented_blank_combo(self):
-        text = "# comment\n\n  \nz=1"
-        self.assertEqual(parse_kv(text), {"z": "1"})
-
-    def test_no_equals_raises_value_error(self):
-        with self.assertRaises(ValueError) as ctx:
-            parse_kv("nospaces")
-        self.assertIn("nospaces", str(ctx.exception))
-
-    def test_empty_text_returns_empty_dict(self):
-        self.assertEqual(parse_kv(""), {})
+    def test_a_pull_command_names_the_model_it_pulls(self):
+        # What `discover --write-models` writes, fed straight back in.
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "models.txt"
+            path.write_text(textwrap.dedent("""\
+                # suggested by codesift discover
+                ollama pull qwen3:14b
+                granite4:8b
+                """), encoding="utf-8")
+            self.assertEqual(read_model_file(path), ["qwen3:14b", "granite4:8b"])
 
 
 class TestGpuLock(unittest.TestCase):
@@ -119,6 +98,40 @@ class TestGpuLock(unittest.TestCase):
             self.assertIn("ACQUIRED", second.stdout)
             self.assertGreater(waited, 1.0,
                                "second process did not wait for the lock to be released")
+
+
+class TestWorkingDepth(unittest.TestCase):
+    """The depth measurements follow the window the user chose.
+
+    A depth fixed at 48,000 tokens was only coherent against the 65,536 it was
+    picked for. Anyone running a smaller window -- which is the usual reason to
+    change it, since the KV cache is what pushes a model off the GPU -- got a
+    prompt that could not fit, so every model read as truncated and the context
+    gate rejected the whole field.
+    """
+
+    WINDOWS = (65536, 32768, 16384, 131072)
+
+    def test_the_prompt_always_fits_the_window(self):
+        for ctx in self.WINDOWS:
+            with self.subTest(ctx=ctx):
+                self.assertLess(working_depth(ctx), ctx)
+
+    def test_room_is_left_for_the_reply(self):
+        # Filling the window leaves nothing to answer with, and Ollama drops the
+        # overflow silently rather than refusing the request.
+        for ctx in self.WINDOWS:
+            with self.subTest(ctx=ctx):
+                self.assertGreaterEqual(ctx - working_depth(ctx), ctx // 8)
+
+    def test_the_depth_is_most_of_the_window(self):
+        # Too shallow and the measurement stops resembling a coding session.
+        for ctx in self.WINDOWS:
+            with self.subTest(ctx=ctx):
+                self.assertGreater(working_depth(ctx), ctx // 2)
+
+    def test_a_32k_window_measures_at_24k(self):
+        self.assertEqual(working_depth(32768), 24576)
 
 
 if __name__ == "__main__":

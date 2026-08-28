@@ -1,7 +1,14 @@
-"""Task definitions for each stage of the screen."""
-from . import agent, basic, hard
+# SPDX-FileCopyrightText: 2026 Thomas Ascher <thomas.ascher@gmx.at>
+#
+# SPDX-License-Identifier: MIT
+"""The tasks the screen puts to a model, one module per kind.
 
-TASKSETS = {"basic": basic.TASKS, "hard": hard.TASKS}
-AGENT_TASKS = agent.TASKS
+Small on purpose: this filters models that cannot do the work, it does not rank
+the ones that can.
+"""
+from . import codegen, edit, format, toolcall, trace
 
-__all__ = ["TASKSETS", "AGENT_TASKS", "basic", "hard", "agent"]
+TASKS = (codegen.TASKS + edit.TASKS + format.TASKS
+         + toolcall.TASKS + trace.TASKS)
+
+__all__ = ["TASKS"]

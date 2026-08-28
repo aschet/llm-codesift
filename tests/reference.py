@@ -1,11 +1,13 @@
-"""Known-good solutions for the task suites.
+# SPDX-FileCopyrightText: 2026 Thomas Ascher <thomas.ascher@gmx.at>
+#
+# SPDX-License-Identifier: MIT
+"""Known-good solutions for the tasks that run code.
 
-Every task must be solvable, and every seeded defect must genuinely fail. These
-solutions prove both, so a task that silently accepts anything is caught here
-rather than in a measurement run.
+Every task must be solvable. These solutions prove it, so a task that silently
+accepts anything is caught here rather than in a measurement run.
 """
 
-BASIC = {
+SOLUTIONS = {
 "cg_version": """
 def parse_version(s):
     parts = [int(p) for p in s.split('.')][:3]
@@ -72,10 +74,8 @@ class Counter2:
     def most_common(self, k):
         return sorted(self.counts.items(), key=lambda kv: (-kv[1], kv[0]))[:k]
 """,
-}
 
-HARD = {
-"h_cg_roman": """
+"cg_roman": """
 def to_roman(n):
     if not isinstance(n, int) or n < 1 or n > 3999:
         raise ValueError(n)
@@ -88,7 +88,7 @@ def to_roman(n):
             n -= v
     return ''.join(out)
 """,
-"h_cg_semver": """
+"cg_semver": """
 def _pre(p):
     out = []
     for part in p.split('.'):
@@ -113,7 +113,7 @@ def cmp_semver(a, b):
         return -1 if la < lb else 1
     return 0
 """,
-"h_cg_tokenize": r"""
+"cg_tokenize": r"""
 def tokenize(s):
     toks, cur, in_q, has = [], [], False, False
     i = 0
@@ -138,7 +138,7 @@ def tokenize(s):
         toks.append(''.join(cur))
     return toks
 """,
-"h_ed_cache": """
+"ed_cache": """
 from collections import OrderedDict
 class Cache:
     def __init__(self, cap):
@@ -156,7 +156,7 @@ class Cache:
             self.data.popitem(last=False)
         self.data[k] = v
 """,
-"h_ed_paginate": """
+"ed_paginate": """
 def paginate(items, page, per_page):
     if per_page < 1:
         raise ValueError('per_page must be >= 1')
@@ -165,86 +165,215 @@ def paginate(items, page, per_page):
     start = (page - 1) * per_page
     return items[start:start + per_page]
 """,
+"cg_topo": """
+def topo_sort(graph):
+    nodes = set(graph)
+    for after in graph.values():
+        nodes.update(after)
+    state, order = {}, []
+    def visit(n):
+        if state.get(n) == 'done':
+            return True
+        if state.get(n) == 'open':
+            return False
+        state[n] = 'open'
+        for m in graph.get(n, []):
+            if not visit(m):
+                return False
+        state[n] = 'done'
+        order.append(n)
+        return True
+    for n in sorted(nodes, key=str):
+        if not visit(n):
+            return None
+    return order[::-1]
+""",
+"cg_pathnorm": """
+def normalise_path(path):
+    absolute = path.startswith('/')
+    out = []
+    for part in path.split('/'):
+        if part in ('', '.'):
+            continue
+        if part == '..':
+            if out and out[-1] != '..':
+                out.pop()
+            elif not absolute:
+                out.append('..')
+            continue
+        out.append(part)
+    joined = '/'.join(out)
+    if absolute:
+        return '/' + joined
+    return joined or '.'
+""",
+"cg_csvline": """
+def split_csv(line):
+    fields, field, i, quoted = [], [], 0, False
+    while i < len(line):
+        c = line[i]
+        if quoted:
+            if c == '"':
+                if i + 1 < len(line) and line[i + 1] == '"':
+                    field.append('"')
+                    i += 1
+                else:
+                    quoted = False
+            else:
+                field.append(c)
+        elif c == '"':
+            quoted = True
+        elif c == ',':
+            fields.append(''.join(field))
+            field = []
+        else:
+            field.append(c)
+        i += 1
+    fields.append(''.join(field))
+    return fields
+""",
+"cg_rle": """
+def rle_encode(text):
+    out, i = [], 0
+    while i < len(text):
+        j = i
+        while j < len(text) and text[j] == text[i]:
+            j += 1
+        run = j - i
+        if run > 1:
+            out.append(text[i] + '#' + str(run) + '#')
+        else:
+            out.append(text[i] if text[i] != '#' else '##')
+        i = j
+    return ''.join(out)
+
+def rle_decode(code):
+    out, i = [], 0
+    while i < len(code):
+        c = code[i]
+        if i + 1 < len(code) and code[i + 1] == '#':
+            end = code.index('#', i + 2)
+            out.append(c * int(code[i + 2:end]))
+            i = end + 1
+        elif c == '#':
+            out.append('#')
+            i += 2
+        else:
+            out.append(c)
+            i += 1
+    return ''.join(out)
+""",
+"cg_bsearch": """
+def insert_point(sorted_items, value):
+    lo, hi = 0, len(sorted_items)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if sorted_items[mid] < value:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+""",
+"cg_expr": """
+def evaluate(expression):
+    text = expression.replace(' ', '')
+    pos = 0
+    def number():
+        nonlocal pos
+        start = pos
+        while pos < len(text) and text[pos].isdigit():
+            pos += 1
+        return int(text[start:pos])
+    def atom():
+        nonlocal pos
+        if text[pos] == '(':
+            pos += 1
+            value = expr()
+            pos += 1
+            return value
+        if text[pos] == '-':
+            pos += 1
+            return -atom()
+        return number()
+    def term():
+        nonlocal pos
+        value = atom()
+        while pos < len(text) and text[pos] in '*/':
+            op = text[pos]
+            pos += 1
+            rhs = atom()
+            value = value * rhs if op == '*' else value / rhs
+        return value
+    def expr():
+        nonlocal pos
+        value = term()
+        while pos < len(text) and text[pos] in '+-':
+            op = text[pos]
+            pos += 1
+            rhs = term()
+            value = value + rhs if op == '+' else value - rhs
+        return value
+    return expr()
+""",
+"cg_wrap": """
+def wrap_text(text, width):
+    words = text.split()
+    lines, current = [], ''
+    for word in words:
+        candidate = word if not current else current + ' ' + word
+        if current and len(candidate) > width:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines
+""",
+"cg_duration": """
+import re
+def parse_duration(text):
+    if not text or not re.fullmatch(r'(\\d+[dhms])+', text):
+        raise ValueError(f'cannot read {text!r} as a duration')
+    seconds = {'d': 86400, 'h': 3600, 'm': 60, 's': 1}
+    return sum(int(n) * seconds[u] for n, u in re.findall(r'(\\d+)([dhms])', text))
+""",
+"ed_window": """
+def rolling_max(items, size):
+    return [max(items[i:i + size]) for i in range(len(items) - size + 1)]
+""",
+"ed_swallow": """
+def load_all(rows, parse):
+    out, errors = [], []
+    for row in rows:
+        try:
+            out.append(parse(row))
+        except ValueError as exc:
+            errors.append(str(exc))
+    return out, errors
+""",
+"ed_earlyreturn": """
+def find_all(items, predicate):
+    return [i for i, item in enumerate(items) if predicate(item)]
+""",
+"ed_keycollide": """
+def memoise(fn):
+    cache = {}
+
+    def wrapper(*args):
+        key = args
+        if key not in cache:
+            cache[key] = fn(*args)
+        return cache[key]
+
+    return wrapper
+""",
 }
 
 # Files to overwrite in a seeded repository to solve each agent task.
-def _tasklist():
-    """The reference module, flattened to the {path: text} shape the tasks use."""
-    from pathlib import Path
-    root = Path(__file__).parent / "tasklist_reference"
-    return {str(path.relative_to(root)): path.read_text(encoding="utf-8")
-            for path in sorted(root.rglob("*"))
-            if path.is_file() and "__pycache__" not in path.parts}
-
-
-AGENT = {
-    "ag_module": _tasklist(),
-"ag_fixbug": {"src/stats.py": """
-def median(xs):
-    if not xs:
-        raise ValueError("empty")
-    s = sorted(xs)
-    n = len(s)
-    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
-
-
-def mean(xs):
-    if not xs:
-        raise ValueError("empty")
-    return sum(xs) / len(xs)
-"""},
-"ag_feature": {"src/config.py": """
-def load(path):
-    with open(path) as f:
-        return f.read()
-
-
-def parse_kv(text):
-    out = {}
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" not in line:
-            raise ValueError(line)
-        k, _, v = line.partition("=")
-        out[k.strip()] = v.strip()
-    return out
-"""},
-"ag_refactor": {
-    "src/paths.py": """
-import os
-
-
-def normalize_path(p):
-    return os.path.normpath(os.path.expanduser(p))
-""",
-    "src/reader.py": """
-from paths import normalize_path
-
-
-def read(p):
-    with open(normalize_path(p)) as f:
-        return f.read()
-""",
-    "src/writer.py": """
-from paths import normalize_path
-
-
-def write(p, data):
-    with open(normalize_path(p), "w") as f:
-        f.write(data)
-""",
-},
-}
-
-
-# The two format tasks that forbid fences also forbid comments, docstrings and
-# type hints, so their answers cannot come from the solutions above, which are
-# written for readability.
 BARE = {
     "fmt_barecode": "def add(a, b):\n    return a + b",
-    "h_fmt_negative": ("def is_palindrome(s):\n"
+    "fmt_negative": ("def is_palindrome(s):\n"
                        "    t = [c.lower() for c in s if c.isalnum()]\n"
                        "    return t == t[::-1]"),
 }
@@ -264,7 +393,7 @@ def perfect_answer(task):
     import json as _json
     kind = task["kind"]
     if kind in ("codegen", "edit"):
-        body = (BASIC.get(task["id"]) or HARD.get(task["id"]) or "")
+        body = SOLUTIONS.get(task["id"]) or ""
         return {"content": f"```python\n{body}\n```"}
     if kind == "trace":
         return {"content": task["expect"]}

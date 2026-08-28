@@ -7,12 +7,11 @@ dist/
 venv/
 
 # measurement output and generated reports
-results/
+*_data/
 report.html
+sweep.log
 *.jsonl
+*.bak
 models*.txt
 !models.example.txt
 
-# archived measurement runs
-results-archive-*/
-results-partial-*/
