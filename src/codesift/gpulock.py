@@ -61,7 +61,15 @@ def acquire(label: str = "", *, endpoint: str = "", wait: bool = True,
     # msvcrt locks a byte range, so the file must be non-empty and seekable.
     _handle = open(path, "a+", encoding="utf-8")
     _handle.seek(0)
-    if not _handle.read(1):
+    try:
+        empty = not _handle.read(1)
+    except PermissionError:
+        # Another process already holds the byte range through msvcrt, which on
+        # Windows denies reads of it too, not only competing locks. That it could
+        # be locked at all means it was made non-empty before this process ever
+        # opened it.
+        empty = False
+    if empty:
         _handle.write(" ")
         _handle.flush()
     _handle.seek(0)
